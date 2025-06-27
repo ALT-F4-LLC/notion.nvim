@@ -247,4 +247,4 @@ Built-in debouncing prevents API abuse:
 
 ## License
 
-MIT
+APACHE 2.0
