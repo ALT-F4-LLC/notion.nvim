@@ -18,6 +18,23 @@
         system,
         ...
       }: {
+        packages.notion-nvim = pkgs.vimUtils.buildVimPlugin {
+          dependencies = with pkgs.vimPlugins; [plenary-nvim];
+          pname = "notion-nvim";
+          version = "unstable";
+          src = ./.;
+
+          meta = with pkgs.lib; {
+            description = "Neovim plugin for Notion integration";
+            homepage = "https://github.com/ALT-F4-LLC/notion.nvim";
+            license = licenses.asl20;
+            maintainers = [];
+            platforms = platforms.all;
+          };
+        };
+
+        packages.default = self'.packages.notion-nvim;
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             entr
@@ -27,6 +44,7 @@
             lua54Packages.luacov
             luajit
             luarocks
+            yamllint
           ];
 
           shellHook = ''
