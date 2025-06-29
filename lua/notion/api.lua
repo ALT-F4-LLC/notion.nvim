@@ -352,6 +352,20 @@ local function block_to_comparable_string(block)
     -- Todo blocks
     content = (block[block_type].checked and "checked" or "unchecked") .. ":" ..
       rich_text_to_markdown(block[block_type].rich_text or {})
+  elseif block_type == "image" and block[block_type].external then
+    -- Image blocks
+    local caption = ""
+    if block[block_type].caption then
+      caption = rich_text_to_markdown(block[block_type].caption)
+    end
+    content = "image:" .. (block[block_type].external.url or "") .. ":" .. caption
+  elseif block_type == "image" and block[block_type].file then
+    -- File image blocks
+    local caption = ""
+    if block[block_type].caption then
+      caption = rich_text_to_markdown(block[block_type].caption)
+    end
+    content = "image:" .. (block[block_type].file.url or "") .. ":" .. caption
   end
 
   return block_type .. ":" .. content
@@ -449,6 +463,21 @@ local function blocks_to_markdown(blocks)
       table.insert(lines, text)
       table.insert(lines, "```")
       table.insert(lines, "")
+    elseif block.type == 'image' then
+      local caption = ""
+      if block.image.caption and #block.image.caption > 0 then
+        caption = rich_text_to_markdown(block.image.caption)
+      end
+      local url = ""
+      if block.image.type == "external" and block.image.external and block.image.external.url then
+        url = block.image.external.url
+      elseif block.image.type == "file" and block.image.file and block.image.file.url then
+        url = block.image.file.url
+      end
+      if url ~= "" then
+        table.insert(lines, "![" .. caption .. "](" .. url .. ")")
+        table.insert(lines, "")
+      end
     end
   end
 
@@ -626,6 +655,19 @@ local function markdown_line_to_block(line)
       type = "numbered_list_item",
       numbered_list_item = {
         rich_text = parse_rich_text(text)
+      }
+    }
+  elseif line:match("^!%[.-%]%(.*%)$") then
+    -- Image syntax: ![caption](url)
+    local caption, url = line:match("^!%[(.-)%]%((.*)%)$")
+    return {
+      type = "image",
+      image = {
+        type = "external",
+        external = {
+          url = url
+        },
+        caption = caption and caption ~= "" and parse_rich_text(caption) or {}
       }
     }
   else
