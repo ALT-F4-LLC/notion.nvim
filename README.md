@@ -8,6 +8,7 @@ A Neovim plugin for seamless integration with Notion's API, allowing you to edit
 - **Intelligent sync** - Diff-based synchronization that only updates changed content
 - **Markdown support** - Full markdown syntax with rich text formatting (bold, italic, code, links)
 - **Smart debouncing** - Prevents API abuse with configurable sync delays
+- **Image support** - Embed and edit images with captions using markdown syntax
 - **Block preservation** - Maintains Notion block structure and ordering
 - **Cross-platform** - Works on macOS, Linux, and Windows
 - **Debug mode** - Detailed timing information for performance analysis
@@ -133,6 +134,7 @@ When you edit a Notion page:
    - `- ` bulleted lists
    - `1. ` numbered lists
    - ````code blocks````
+   - `![caption](url)` images
 
 3. **Intelligent sync** - Only modified blocks are updated, preserving unchanged content
 4. **Instant feedback** - Success/error notifications after each save
@@ -237,6 +239,7 @@ notion.open_page_by_url('https://notion.so/...')
 - `numbered_list_item` - Numbered lists
 - `to_do` - Checkbox items
 - `code` - Code blocks with language detection
+- `image` - Images with captions (both external URLs and Notion-hosted files)
 
 ### Rate Limiting
 
