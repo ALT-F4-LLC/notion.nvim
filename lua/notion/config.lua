@@ -11,6 +11,32 @@ M.defaults = {
 
 M.options = {}
 
+-- Sanitize command for display (remove sensitive parts)
+local function sanitize_command_for_display(cmd)
+  if type(cmd) == "table" then
+    local sanitized = {}
+    for i, part in ipairs(cmd) do
+      -- Keep command name and safe flags, redact potential token values
+      if i == 1 then
+        -- Always keep the command name
+        table.insert(sanitized, part)
+      elseif part:match("^%-%-?[%w%-]+$") then
+        -- Keep flags that start with - or --
+        table.insert(sanitized, part)
+      else
+        -- Redact everything else (likely token values, secrets, etc.)
+        table.insert(sanitized, '[REDACTED]')
+      end
+    end
+    return sanitized
+  elseif type(cmd) == "string" then
+    -- For string commands, only show the first word (command name)
+    local command_name = cmd:match("^%S+")
+    return command_name and (command_name .. " [REDACTED]") or "[REDACTED]"
+  end
+  return "[REDACTED]"
+end
+
 -- Helper function to execute a command and get the output
 local function execute_command(cmd)
   if type(cmd) == "table" then
@@ -39,8 +65,9 @@ function M.setup(opts)
     -- Try command-based retrieval first
     M.options.notion_token = execute_command(M.options.notion_token_cmd)
     if not M.options.notion_token then
+      local sanitized_cmd = sanitize_command_for_display(M.options.notion_token_cmd)
       vim.notify('Failed to retrieve token from command: ' ..
-        vim.inspect(M.options.notion_token_cmd), vim.log.levels.ERROR)
+        vim.inspect(sanitized_cmd), vim.log.levels.ERROR)
     end
   else
     -- Fall back to environment variable

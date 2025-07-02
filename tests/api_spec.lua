@@ -379,5 +379,65 @@ describe("api", function()
       assert.equals(1, #notifications)
       assert.is_not_nil(string.match(notifications[1].msg, "token not configured"))
     end)
+
+    it("should sanitize tokens in error messages", function()
+      local test_token = "secret_token_12345"
+      mock_config.get = function(key)
+        if key == "notion_token" then return test_token end
+        if key == "debug" then return false end
+        if key == "database_id" then return "test_db_id" end
+        return "test_value"
+      end
+
+      -- Mock curl to return an error response containing the token
+      mock_curl.post = spy.new(function()
+        return {
+          status = 401,
+          body = '{"error": "Invalid token: ' .. test_token .. '"}'
+        }
+      end)
+
+      local notifications = {}
+      vim.notify = function(msg, level)
+        table.insert(notifications, { msg = msg, level = level })
+      end
+
+      api.list_pages()
+
+      assert.equals(1, #notifications)
+      -- Verify the token is sanitized in the error message
+      assert.is_nil(string.match(notifications[1].msg, test_token))
+      assert.is_not_nil(string.match(notifications[1].msg, "%[REDACTED%]"))
+    end)
+
+    it("should sanitize Bearer tokens in error messages", function()
+      local test_token = "secret_bearer_token"
+      mock_config.get = function(key)
+        if key == "notion_token" then return test_token end
+        if key == "debug" then return false end
+        if key == "database_id" then return "test_db_id" end
+        return "test_value"
+      end
+
+      -- Mock curl to return an error response containing the Bearer token
+      mock_curl.post = spy.new(function()
+        return {
+          status = 403,
+          body = '{"message": "Authorization failed for Bearer ' .. test_token .. '"}'
+        }
+      end)
+
+      local notifications = {}
+      vim.notify = function(msg, level)
+        table.insert(notifications, { msg = msg, level = level })
+      end
+
+      api.create_page("Test Page")
+
+      assert.equals(1, #notifications)
+      -- Verify the Bearer token is sanitized
+      assert.is_nil(string.match(notifications[1].msg, test_token))
+      assert.is_not_nil(string.match(notifications[1].msg, "Bearer %[REDACTED%]"))
+    end)
   end)
 end)

@@ -108,5 +108,77 @@ describe("config", function()
 
       assert.is_nil(config.get('notion_token'))
     end)
+
+    it("should sanitize command in error messages for string commands", function()
+      vim.fn.system = function(cmd)
+        return ""
+      end
+      vim.v.shell_error = 1
+
+      local notifications = {}
+      vim.notify = function(msg, level)
+        table.insert(notifications, { msg = msg, level = level })
+      end
+
+      config.setup({
+        notion_token_cmd = "doppler secrets get NOTION_TOKEN --plain"
+      })
+
+      assert.equals(2, #notifications) -- One for failed command, one for token not configured
+      -- Find the command failure notification
+      local command_error_msg = nil
+      for _, notif in ipairs(notifications) do
+        if string.match(notif.msg, "Failed to retrieve token") then
+          command_error_msg = notif.msg
+          break
+        end
+      end
+
+      assert.is_not_nil(command_error_msg)
+      -- Verify the command is sanitized (only shows command name)
+      assert.is_not_nil(string.match(command_error_msg, "doppler %[REDACTED%]"))
+      assert.is_nil(string.match(command_error_msg, "NOTION_TOKEN"))
+      assert.is_nil(string.match(command_error_msg, "--plain"))
+    end)
+
+    it("should sanitize command in error messages for table commands", function()
+      vim.fn.system = function(cmd)
+        return ""
+      end
+      vim.v.shell_error = 1
+
+      local notifications = {}
+      vim.notify = function(msg, level)
+        table.insert(notifications, { msg = msg, level = level })
+      end
+
+      config.setup({
+        notion_token_cmd = {"doppler", "secrets", "get", "--plain", "NOTION_TOKEN"}
+      })
+
+      assert.equals(2, #notifications) -- One for failed command, one for token not configured
+
+      -- Check that NOTION_TOKEN is not present in command failure notifications
+      local found_token_in_command_error = false
+      for _, notif in ipairs(notifications) do
+        if string.match(notif.msg, "Failed to retrieve token") and string.match(notif.msg, "NOTION_TOKEN") then
+          found_token_in_command_error = true
+          break
+        end
+      end
+
+      assert.is_false(found_token_in_command_error, "Token value should not appear in command error messages")
+
+      -- Check that at least one notification mentions command failure
+      local found_command_error = false
+      for _, notif in ipairs(notifications) do
+        if string.match(notif.msg, "Failed to retrieve token") then
+          found_command_error = true
+          break
+        end
+      end
+
+      assert.is_true(found_command_error, "Should have command failure notification")
+    end)
   end)
 end)

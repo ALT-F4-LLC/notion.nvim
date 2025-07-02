@@ -30,6 +30,27 @@ local function notify_user(message, level)
   vim.notify(message, level or vim.log.levels.INFO)
 end
 
+-- Escape special characters for pattern matching
+local function escape_pattern(str)
+  return str:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+end
+
+-- Sanitize error messages to remove any potential token exposure
+local function sanitize_error_message(message, token)
+  if not message or not token then
+    return message
+  end
+
+  -- Replace any occurrence of the token with [REDACTED]
+  local escaped_token = escape_pattern(token)
+  local sanitized = message:gsub(escaped_token, '[REDACTED]')
+
+  -- Also handle Bearer token format
+  sanitized = sanitized:gsub('Bearer ' .. escaped_token, 'Bearer [REDACTED]')
+
+  return sanitized
+end
+
 local NOTION_API_URL = 'https://api.notion.com/v1'
 local NOTION_VERSION = '2022-06-28'
 
@@ -78,7 +99,9 @@ local function make_request(method, endpoint, data)
   end
 
   if response.status ~= 200 and response.status ~= 204 then
-    vim.notify('Notion API error: ' .. (response.body or 'Unknown error'), vim.log.levels.ERROR)
+    local error_message = response.body or 'Unknown error'
+    local sanitized_message = sanitize_error_message(error_message, token)
+    vim.notify('Notion API error: ' .. sanitized_message, vim.log.levels.ERROR)
     return nil
   end
 
