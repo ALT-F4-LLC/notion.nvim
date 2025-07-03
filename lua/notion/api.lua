@@ -73,31 +73,45 @@ local function make_request(method, endpoint, data)
   local all_results = nil
 
   local function perform_request(url, body)
-    local opts = {
-      url = url,
-      headers = headers,
-      timeout = 10000,
-      compressed = false,
-    }
-
-    if (method == 'POST' or method == 'PATCH') and body then
-      opts.body = vim.json.encode(body)
-    end
-
+    local retries = 3
     local response
-    if method == 'GET' then
-      response = curl.get(opts)
-    elseif method == 'POST' then
-      response = curl.post(opts)
-    elseif method == 'PATCH' then
-      response = curl.patch(opts)
-    elseif method == 'DELETE' then
-      response = curl.delete(opts)
+
+    while retries > 0 do
+      local opts = {
+        url = url,
+        headers = headers,
+        timeout = 10000,
+        compressed = false,
+      }
+
+      if (method == 'POST' or method == 'PATCH') and body then
+        opts.body = vim.json.encode(body)
+      end
+
+      if method == 'GET' then
+        response = curl.get(opts)
+      elseif method == 'POST' then
+        response = curl.post(opts)
+      elseif method == 'PATCH' then
+        response = curl.patch(opts)
+      elseif method == 'DELETE' then
+        response = curl.delete(opts)
+      end
+
+      if response and response.status == 429 then
+        retries = retries - 1
+        local retry_after = response.headers['Retry-After'] or '1'
+        vim.notify('Rate limited. Retrying after ' .. retry_after .. ' seconds...', vim.log.levels.WARN)
+        vim.loop.sleep(tonumber(retry_after) * 1000)
+      else
+        break
+      end
     end
 
     if debug and request_start then
       local request_end = vim.loop.hrtime()
-      table.insert(debug_messages, method .. " request to " .. url .. " took: " .. ((request_end - request_start) / 1000000) .. "ms")
+      table.insert(debug_messages, method .. " request to " .. url .. " took: " ..
+        ((request_end - request_start) / 1000000) .. "ms")
     end
 
     if response.status ~= 200 and response.status ~= 204 then
@@ -127,8 +141,6 @@ local function make_request(method, endpoint, data)
     local request_data = data
 
     if next_cursor then
-      -- For GET requests, add start_cursor to the URL query parameters.
-      -- For POST requests, it should be in the body.
       if method == 'GET' then
         current_url = current_url .. (current_url:find('?') and '&' or '?') .. 'start_cursor=' .. next_cursor
       elseif method == 'POST' and request_data then
@@ -139,7 +151,7 @@ local function make_request(method, endpoint, data)
     local result = perform_request(current_url, request_data)
 
     if result == nil then return nil end
-    if result == true then return true end -- For DELETE requests
+    if result == true then return true end
 
     if all_results == nil then
       all_results = result
@@ -166,11 +178,13 @@ function M.get_all_blocks(block_id)
 
   if blocks_result and blocks_result.results then
     for _, block in ipairs(blocks_result.results) do
-      table.insert(all_blocks, block)
-      if block.has_children then
-        local child_blocks = M.get_all_blocks(block.id)
-        for _, child_block in ipairs(child_blocks) do
-          table.insert(all_blocks, child_block)
+      if not block.in_trash then
+        table.insert(all_blocks, block)
+        if block.has_children then
+          local child_blocks = M.get_all_blocks(block.id)
+          for _, child_block in ipairs(child_blocks) do
+            table.insert(all_blocks, child_block)
+          end
         end
       end
     end
@@ -494,9 +508,10 @@ local function calculate_diff_operations(existing_blocks_results, new_blocks)
       j = j + 1
     else
       -- Type mismatch or other difference. We need to find the next sync point.
-      local found_sync_point = false
-      for k = i, num_existing do
-        for l = j, num_new do
+      local k = i
+      while k <= num_existing do
+        local l = j
+        while l <= num_new do
           if block_to_comparable_string(existing_blocks[k]) == block_to_comparable_string(new_blocks[l]) then
             -- Found a sync point. Delete blocks from i to k-1 and insert from j to l-1.
             for del_idx = i, k - 1 do
@@ -512,35 +527,31 @@ local function calculate_diff_operations(existing_blocks_results, new_blocks)
                 after = last_stable_block_id,
               })
             end
-            -- We can't know the ID of the newly inserted blocks, so we can't set last_stable_block_id
-            -- This means the next insert chunk will be appended after the same block, which is not ideal
-            -- but is a limitation of the batch API. For most cases this should be acceptable.
             i = k
             j = l
-            found_sync_point = true
             goto continue_outer_loop
           end
+          l = l + 1
         end
+        k = k + 1
       end
 
-      if not found_sync_point then
-        -- No sync point found. Delete remaining old blocks and insert remaining new ones.
-        for del_idx = i, num_existing do
-          table.insert(operations.deletes, { block_id = existing_blocks[del_idx].id })
-        end
-        local children_to_insert = {}
-        for ins_idx = j, num_new do
-          table.insert(children_to_insert, new_blocks[ins_idx])
-        end
-        if #children_to_insert > 0 then
-          table.insert(operations.inserts, {
-            children = children_to_insert,
-            after = last_stable_block_id,
-          })
-        end
-        i = num_existing + 1
-        j = num_new + 1
+      -- No sync point found. Delete remaining old blocks and insert remaining new ones.
+      for del_idx = i, num_existing do
+        table.insert(operations.deletes, { block_id = existing_blocks[del_idx].id })
       end
+      local children_to_insert = {}
+      for ins_idx = j, num_new do
+        table.insert(children_to_insert, new_blocks[ins_idx])
+      end
+      if #children_to_insert > 0 then
+        table.insert(operations.inserts, {
+          children = children_to_insert,
+          after = last_stable_block_id,
+        })
+      end
+      i = num_existing + 1
+      j = num_new + 1
       ::continue_outer_loop::
     end
   end
@@ -1001,7 +1012,19 @@ function M.sync_page()
 
   for _, insert_op in ipairs(operations.inserts) do
     if insert_op.children and #insert_op.children > 0 then
-      make_request('PATCH', '/blocks/' .. page_id .. '/children', insert_op)
+      local children = insert_op.children
+      local chunk_size = 100
+      for i = 1, #children, chunk_size do
+        local chunk = {}
+        for j = i, math.min(i + chunk_size - 1, #children) do
+          table.insert(chunk, children[j])
+        end
+        local chunk_insert_op = {
+          children = chunk,
+          after = insert_op.after
+        }
+        make_request('PATCH', '/blocks/' .. page_id .. '/children', chunk_insert_op)
+      end
     end
   end
 
