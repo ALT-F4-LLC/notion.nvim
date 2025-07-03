@@ -54,6 +54,7 @@ end
 local NOTION_API_URL = 'https://api.notion.com/v1'
 local NOTION_VERSION = '2022-06-28'
 
+
 local function make_request(method, endpoint, data)
   local debug = config.get('debug')
   local request_start = debug and vim.loop.hrtime() or nil
@@ -69,8 +70,6 @@ local function make_request(method, endpoint, data)
     ['Content-Type'] = 'application/json',
     ['Notion-Version'] = NOTION_VERSION,
   }
-
-  local all_results = nil
 
   local function perform_request(url, body)
     local retries = 3
@@ -133,62 +132,55 @@ local function make_request(method, endpoint, data)
     return result
   end
 
+  local url = NOTION_API_URL .. endpoint
+
+  if data and data.start_cursor then
+    if method == 'GET' then
+      url = url .. (url:find('?') and '&' or '?') .. 'start_cursor=' .. data.start_cursor
+    end
+  end
+
+  return perform_request(url, data)
+end
+
+function M.get_all_blocks(block_id)
+  local all_blocks = {}
   local next_cursor = nil
-  local initial_url = NOTION_API_URL .. endpoint
 
   repeat
-    local current_url = initial_url
-    local request_data = data
-
+    local data = nil
     if next_cursor then
-      if method == 'GET' then
-        current_url = current_url .. (current_url:find('?') and '&' or '?') .. 'start_cursor=' .. next_cursor
-      elseif method == 'POST' and request_data then
-        request_data.start_cursor = next_cursor
+      data = { start_cursor = next_cursor }
+    end
+
+    local blocks_result = M.make_request('GET', '/blocks/' .. block_id .. '/children', data)
+
+    if blocks_result == nil then
+      -- If the request failed, retry once
+      blocks_result = M.make_request('GET', '/blocks/' .. block_id .. '/children', data)
+    end
+
+    if blocks_result and blocks_result.results then
+      for _, block in ipairs(blocks_result.results) do
+        if not block.in_trash then
+          table.insert(all_blocks, block)
+          if block.has_children then
+            local child_blocks = M.get_all_blocks(block.id)
+            for _, child_block in ipairs(child_blocks) do
+              table.insert(all_blocks, child_block)
+            end
+          end
+        end
       end
     end
 
-    local result = perform_request(current_url, request_data)
-
-    if result == nil then return nil end
-    if result == true then return true end
-
-    if all_results == nil then
-      all_results = result
-    elseif result.results then
-      for _, item in ipairs(result.results) do
-        table.insert(all_results.results, item)
-      end
-    end
-
-    if result.has_more and result.next_cursor then
-      next_cursor = result.next_cursor
+    if blocks_result and blocks_result.has_more and blocks_result.next_cursor then
+      next_cursor = blocks_result.next_cursor
     else
       next_cursor = nil
     end
 
   until not next_cursor
-
-  return all_results
-end
-
-function M.get_all_blocks(block_id)
-  local all_blocks = {}
-  local blocks_result = make_request('GET', '/blocks/' .. block_id .. '/children')
-
-  if blocks_result and blocks_result.results then
-    for _, block in ipairs(blocks_result.results) do
-      if not block.in_trash then
-        table.insert(all_blocks, block)
-        if block.has_children then
-          local child_blocks = M.get_all_blocks(block.id)
-          for _, child_block in ipairs(child_blocks) do
-            table.insert(all_blocks, child_block)
-          end
-        end
-      end
-    end
-  end
 
   return all_blocks
 end
@@ -618,7 +610,6 @@ local function blocks_to_markdown(blocks)
         table.insert(lines, line)
       end
       table.insert(lines, "```")
-      table.insert(lines, "")
     elseif block.type == 'image' then
       local caption = ""
       if block.image.caption and #block.image.caption > 0 then
@@ -1111,5 +1102,11 @@ function M.list_and_edit_pages()
     end)
   end
 end
+
+M.calculate_diff_operations = calculate_diff_operations
+M.block_to_comparable_string = block_to_comparable_string
+M.blocks_to_markdown = blocks_to_markdown
+M.markdown_line_to_block = markdown_line_to_block
+M.make_request = make_request
 
 return M
