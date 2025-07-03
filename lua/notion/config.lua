@@ -88,4 +88,12 @@ function M.get(key)
   return M.options[key]
 end
 
+function M.get_last_sync(page_id)
+  return M.options['last_sync_' .. page_id]
+end
+
+function M.set_last_sync(page_id, timestamp)
+  M.options['last_sync_' .. page_id] = timestamp
+end
+
 return M

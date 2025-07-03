@@ -54,6 +54,7 @@ end
 local NOTION_API_URL = 'https://api.notion.com/v1'
 local NOTION_VERSION = '2022-06-28'
 
+
 local function make_request(method, endpoint, data)
   local debug = config.get('debug')
   local request_start = debug and vim.loop.hrtime() or nil
@@ -70,53 +71,118 @@ local function make_request(method, endpoint, data)
     ['Notion-Version'] = NOTION_VERSION,
   }
 
+  local function perform_request(url, body)
+    local retries = 3
+    local response
+
+    while retries > 0 do
+      local opts = {
+        url = url,
+        headers = headers,
+        timeout = 10000,
+        compressed = false,
+      }
+
+      if (method == 'POST' or method == 'PATCH') and body then
+        opts.body = vim.json.encode(body)
+      end
+
+      if method == 'GET' then
+        response = curl.get(opts)
+      elseif method == 'POST' then
+        response = curl.post(opts)
+      elseif method == 'PATCH' then
+        response = curl.patch(opts)
+      elseif method == 'DELETE' then
+        response = curl.delete(opts)
+      end
+
+      if response and response.status == 429 then
+        retries = retries - 1
+        local retry_after = response.headers['Retry-After'] or '1'
+        vim.notify('Rate limited. Retrying after ' .. retry_after .. ' seconds...', vim.log.levels.WARN)
+        vim.loop.sleep(tonumber(retry_after) * 1000)
+      else
+        break
+      end
+    end
+
+    if debug and request_start then
+      local request_end = vim.loop.hrtime()
+      table.insert(debug_messages, method .. " request to " .. url .. " took: " ..
+        ((request_end - request_start) / 1000000) .. "ms")
+    end
+
+    if response.status ~= 200 and response.status ~= 204 then
+      local error_message = response.body or 'Unknown error'
+      local sanitized_message = sanitize_error_message(error_message, token)
+      vim.notify('Notion API error: ' .. sanitized_message, vim.log.levels.ERROR)
+      return nil
+    end
+
+    if not response.body or response.body == "" then
+      return true
+    end
+
+    local ok, result = pcall(vim.json.decode, response.body)
+    if not ok then
+      vim.notify('Failed to parse Notion API response', vim.log.levels.ERROR)
+      return nil
+    end
+    return result
+  end
+
   local url = NOTION_API_URL .. endpoint
-  local opts = {
-    url = url,
-    headers = headers,
-    timeout = 10000, -- Reduced from 30s to 10s
-    compressed = false, -- Disable compression to reduce processing time
-  }
 
-  if (method == 'POST' or method == 'PATCH') and data then
-    opts.body = vim.json.encode(data)
+  if data and data.start_cursor then
+    if method == 'GET' then
+      url = url .. (url:find('?') and '&' or '?') .. 'start_cursor=' .. data.start_cursor
+    end
   end
 
-  local response
-  if method == 'GET' then
-    response = curl.get(opts)
-  elseif method == 'POST' then
-    response = curl.post(opts)
-  elseif method == 'PATCH' then
-    response = curl.patch(opts)
-  elseif method == 'DELETE' then
-    response = curl.delete(opts)
-  end
+  return perform_request(url, data)
+end
 
-  if debug and request_start then
-    local request_end = vim.loop.hrtime()
-    table.insert(debug_messages, method .. " request took: " .. ((request_end - request_start) / 1000000) .. "ms")
-  end
+function M.get_all_blocks(block_id)
+  local all_blocks = {}
+  local next_cursor = nil
 
-  if response.status ~= 200 and response.status ~= 204 then
-    local error_message = response.body or 'Unknown error'
-    local sanitized_message = sanitize_error_message(error_message, token)
-    vim.notify('Notion API error: ' .. sanitized_message, vim.log.levels.ERROR)
-    return nil
-  end
+  repeat
+    local data = nil
+    if next_cursor then
+      data = { start_cursor = next_cursor }
+    end
 
-  -- Handle empty responses (like DELETE)
-  if not response.body or response.body == "" then
-    return true
-  end
+    local blocks_result = M.make_request('GET', '/blocks/' .. block_id .. '/children', data)
 
-  local ok, result = pcall(vim.json.decode, response.body)
-  if not ok then
-    vim.notify('Failed to parse Notion API response', vim.log.levels.ERROR)
-    return nil
-  end
+    if blocks_result == nil then
+      -- If the request failed, retry once
+      blocks_result = M.make_request('GET', '/blocks/' .. block_id .. '/children', data)
+    end
 
-  return result
+    if blocks_result and blocks_result.results then
+      for _, block in ipairs(blocks_result.results) do
+        if not block.in_trash then
+          table.insert(all_blocks, block)
+          if block.has_children then
+            local child_blocks = M.get_all_blocks(block.id)
+            for _, child_block in ipairs(child_blocks) do
+              table.insert(all_blocks, child_block)
+            end
+          end
+        end
+      end
+    end
+
+    if blocks_result and blocks_result.has_more and blocks_result.next_cursor then
+      next_cursor = blocks_result.next_cursor
+    else
+      next_cursor = nil
+    end
+
+  until not next_cursor
+
+  return all_blocks
 end
 
 function M.create_page(title)
@@ -366,15 +432,15 @@ local function block_to_comparable_string(block)
   end
 
   local content = ""
-  if block[block_type].rich_text then
+  if block_type == "to_do" then
+    -- Handle Todo blocks specifically to include checked state
+    content = (block.to_do.checked and "checked" or "unchecked") .. ":" ..
+      rich_text_to_markdown(block.to_do.rich_text or {})
+  elseif block[block_type].rich_text then
     content = rich_text_to_markdown(block[block_type].rich_text)
   elseif block[block_type].language then
     -- Code blocks
     content = block[block_type].language .. ":" .. rich_text_to_markdown(block[block_type].rich_text or {})
-  elseif block[block_type].checked ~= nil then
-    -- Todo blocks
-    content = (block[block_type].checked and "checked" or "unchecked") .. ":" ..
-      rich_text_to_markdown(block[block_type].rich_text or {})
   elseif block_type == "image" and block[block_type].external then
     -- Image blocks
     local caption = ""
@@ -395,57 +461,114 @@ local function block_to_comparable_string(block)
 end
 
 -- Calculate diff operations between existing and new blocks
-local function calculate_diff_operations(existing, new_blocks)
-  local deletes = {}
-  local inserts = {}
+local function calculate_diff_operations(existing_blocks_results, new_blocks)
+  local operations = {
+    updates = {},
+    deletes = {},
+    inserts = {}, -- This will be a list of insert operations
+    noops = 0,
+  }
 
-  -- Simple approach: find exact matches, everything else gets replaced
-  local matched = {}
+  local existing_blocks = existing_blocks_results or {}
+  local num_existing = #existing_blocks
+  local num_new = #new_blocks
 
-  -- Find exact matches
-  for i, existing_block in ipairs(existing) do
-    for j, new_comparable in ipairs(new_blocks) do
-      if existing_block.comparable == new_comparable and not matched[j] then
-        matched[j] = existing_block.id
-        break
+  local i = 1
+  local j = 1
+  local last_stable_block_id = nil
+
+  while i <= num_existing and j <= num_new do
+    local old_block = existing_blocks[i]
+    local new_block = new_blocks[j]
+    local old_comparable = block_to_comparable_string(old_block)
+    local new_comparable = block_to_comparable_string(new_block)
+
+    if old_comparable == new_comparable then
+      -- Blocks are identical, no-op
+      operations.noops = operations.noops + 1
+      last_stable_block_id = old_block.id
+      i = i + 1
+      j = j + 1
+    elseif old_block.type == new_block.type then
+      -- Same type, different content: UPDATE
+      table.insert(operations.updates, {
+        block_id = old_block.id,
+        payload = { [new_block.type] = new_block[new_block.type] },
+      })
+      last_stable_block_id = old_block.id
+      i = i + 1
+      j = j + 1
+    else
+      -- Type mismatch or other difference. We need to find the next sync point.
+      local k = i
+      while k <= num_existing do
+        local l = j
+        while l <= num_new do
+          if block_to_comparable_string(existing_blocks[k]) == block_to_comparable_string(new_blocks[l]) then
+            -- Found a sync point. Delete blocks from i to k-1 and insert from j to l-1.
+            for del_idx = i, k - 1 do
+              table.insert(operations.deletes, { block_id = existing_blocks[del_idx].id })
+            end
+            local children_to_insert = {}
+            for ins_idx = j, l - 1 do
+              table.insert(children_to_insert, new_blocks[ins_idx])
+            end
+            if #children_to_insert > 0 then
+              table.insert(operations.inserts, {
+                children = children_to_insert,
+                after = last_stable_block_id,
+              })
+            end
+            i = k
+            j = l
+            goto continue_outer_loop
+          end
+          l = l + 1
+        end
+        k = k + 1
       end
+
+      -- No sync point found. Delete remaining old blocks and insert remaining new ones.
+      for del_idx = i, num_existing do
+        table.insert(operations.deletes, { block_id = existing_blocks[del_idx].id })
+      end
+      local children_to_insert = {}
+      for ins_idx = j, num_new do
+        table.insert(children_to_insert, new_blocks[ins_idx])
+      end
+      if #children_to_insert > 0 then
+        table.insert(operations.inserts, {
+          children = children_to_insert,
+          after = last_stable_block_id,
+        })
+      end
+      i = num_existing + 1
+      j = num_new + 1
+      ::continue_outer_loop::
     end
   end
 
-  -- Mark unmatched existing blocks for deletion
-  for i, existing_block in ipairs(existing) do
-    local found = false
-    for j, _ in pairs(matched) do
-      if matched[j] == existing_block.id then
-        found = true
-        break
-      end
+  -- Handle trailing blocks
+  if i <= num_existing then
+    -- More old blocks than new ones, delete the excess
+    for k = i, num_existing do
+      table.insert(operations.deletes, { block_id = existing_blocks[k].id })
     end
-    if not found then
-      table.insert(deletes, { block_id = existing_block.id, old_index = i })
+  elseif j <= num_new then
+    -- More new blocks than old ones, insert the excess
+    local children_to_insert = {}
+    for k = j, num_new do
+      table.insert(children_to_insert, new_blocks[k])
     end
-  end
-
-  -- Mark unmatched new blocks for insertion
-  for j, new_comparable in ipairs(new_blocks) do
-    if not matched[j] then
-      -- Try to find the best insertion point
-      local after_block_id = nil
-      if j > 1 and matched[j-1] then
-        after_block_id = matched[j-1]
-      end
-
-      table.insert(inserts, {
-        new_index = j,
-        after_block_id = after_block_id
+    if #children_to_insert > 0 then
+      table.insert(operations.inserts, {
+        children = children_to_insert,
+        after = last_stable_block_id,
       })
     end
   end
 
-  return {
-    deletes = deletes,
-    inserts = inserts
-  }
+  return operations
 end
 
 -- Convert blocks to markdown
@@ -483,9 +606,10 @@ local function blocks_to_markdown(blocks)
       local text = rich_text_to_markdown(block.code.rich_text)
       local language = block.code.language or ""
       table.insert(lines, "```" .. language)
-      table.insert(lines, text)
+      for _, line in ipairs(vim.split(text, "\n")) do
+        table.insert(lines, line)
+      end
       table.insert(lines, "```")
-      table.insert(lines, "")
     elseif block.type == 'image' then
       local caption = ""
       if block.image.caption and #block.image.caption > 0 then
@@ -536,13 +660,10 @@ function M.edit_page(page_id)
   end
 
   -- Get page content blocks
-  local blocks_result = make_request('GET', '/blocks/' .. page_id .. '/children')
-  if not blocks_result then
-    return
-  end
+  local all_blocks = M.get_all_blocks(page_id)
 
   -- Convert blocks to markdown
-  local markdown_lines = blocks_to_markdown(blocks_result.results)
+  local markdown_lines = blocks_to_markdown(all_blocks)
 
   -- Create new buffer
   local buf = vim.api.nvim_create_buf(false, false)
@@ -654,13 +775,12 @@ local function markdown_line_to_block(line)
     }
   elseif line:match("^%- %[[ x]%] ") then
     -- Todo item
-    local checked = line:match("^%- %[x%] ")
-    local text = checked and line:sub(7) or line:sub(6)
+    local checked_char, text = line:match("^%- %[([ x])%] (.*)$")
     return {
       type = "to_do",
       to_do = {
-        checked = checked and true or false,
-        rich_text = parse_rich_text(text)
+        checked = (checked_char == 'x'),
+        rich_text = parse_rich_text(text or "")
       }
     }
   elseif line:match("^%- ") then
@@ -840,78 +960,68 @@ function M.sync_page()
     table.insert(debug_messages, "Getting existing blocks for diff...")
   end
 
-  local existing_blocks = make_request('GET', '/blocks/' .. page_id .. '/children')
+  local existing_blocks = M.get_all_blocks(page_id)
 
   local get_time = debug and vim.loop.hrtime() or nil
   if debug then
     table.insert(debug_messages, "GET existing blocks took: " .. ((get_time - blocks_time) / 1000000) .. "ms")
   end
 
-  -- Convert existing blocks to comparable format for diffing
-  local existing_comparable = {}
-  if existing_blocks and existing_blocks.results then
-    for _, block in ipairs(existing_blocks.results) do
-      local comparable = block_to_comparable_string(block)
-      table.insert(existing_comparable, {
-        id = block.id,
-        comparable = comparable
-      })
-    end
-  end
-
-  -- Convert new blocks to comparable format
-  local new_comparable = {}
-  for _, block in ipairs(blocks) do
-    table.insert(new_comparable, block_to_comparable_string(block))
-  end
-
-  if debug then
-    table.insert(debug_messages, "Comparing " .. #existing_comparable ..
-      " existing vs " .. #new_comparable .. " new blocks")
-  end
-
   -- Find blocks that need to be deleted/updated/inserted
-  local operations = calculate_diff_operations(existing_comparable, new_comparable)
+  local operations = calculate_diff_operations(existing_blocks, blocks)
 
   local diff_time = debug and vim.loop.hrtime() or nil
   if debug then
     table.insert(debug_messages, "Diff calculation took: " .. ((diff_time - get_time) / 1000000) .. "ms")
-    table.insert(debug_messages, "Operations: " .. #operations.deletes ..
-      " deletes, " .. #operations.inserts .. " inserts")
+    local num_inserts = 0
+    for _, op in ipairs(operations.inserts) do
+      num_inserts = num_inserts + #op.children
+    end
+    table.insert(debug_messages, "Operations: " .. #operations.updates .. " updates, " .. #operations.deletes ..
+      " deletes, " .. num_inserts .. " inserts, " .. operations.noops .. " no-ops")
   end
 
-  -- Apply operations in order: deletes first, then inserts with positioning
+  -- Apply operations in order: updates, deletes, then inserts
+  local update_start = debug and vim.loop.hrtime() or nil
+  for _, update_op in ipairs(operations.updates) do
+    make_request('PATCH', '/blocks/' .. update_op.block_id, update_op.payload)
+  end
+
   local delete_start = debug and vim.loop.hrtime() or nil
-  for i, delete_op in ipairs(operations.deletes) do
+  if debug and update_start then
+    table.insert(debug_messages, "All updates took: " .. ((delete_start - update_start) / 1000000) .. "ms")
+  end
+
+  for _, delete_op in ipairs(operations.deletes) do
     make_request('DELETE', '/blocks/' .. delete_op.block_id)
   end
 
-  local delete_end = debug and vim.loop.hrtime() or nil
-  if debug and delete_start then
-    table.insert(debug_messages, "All deletes took: " .. ((delete_end - delete_start) / 1000000) .. "ms")
-  end
-
-  -- Insert new blocks at correct positions using 'after' parameter
   local insert_start = debug and vim.loop.hrtime() or nil
-  for i, insert_op in ipairs(operations.inserts) do
-    local insert_data = { children = { blocks[insert_op.new_index] } }
-
-    -- If we have a position reference, use the 'after' parameter
-    if insert_op.after_block_id then
-      insert_data.after = insert_op.after_block_id
-    end
-
-    make_request('PATCH', '/blocks/' .. page_id .. '/children', insert_data)
+  if debug and delete_start then
+    table.insert(debug_messages, "All deletes took: " .. ((insert_start - delete_start) / 1000000) .. "ms")
   end
 
-  local insert_end = debug and vim.loop.hrtime() or nil
-  if debug and insert_start then
-    table.insert(debug_messages, "All inserts took: " .. ((insert_end - insert_start) / 1000000) .. "ms")
+  for _, insert_op in ipairs(operations.inserts) do
+    if insert_op.children and #insert_op.children > 0 then
+      local children = insert_op.children
+      local chunk_size = 100
+      for i = 1, #children, chunk_size do
+        local chunk = {}
+        for j = i, math.min(i + chunk_size - 1, #children) do
+          table.insert(chunk, children[j])
+        end
+        local chunk_insert_op = {
+          children = chunk,
+          after = insert_op.after
+        }
+        make_request('PATCH', '/blocks/' .. page_id .. '/children', chunk_insert_op)
+      end
+    end
   end
 
   local ops_time = debug and vim.loop.hrtime() or nil
-  if debug then
-    table.insert(debug_messages, "Diff operations took: " .. ((ops_time - diff_time) / 1000000) .. "ms")
+  if debug and insert_start then
+    table.insert(debug_messages, "All inserts took: " .. ((ops_time - insert_start) / 1000000) .. "ms")
   end
 
   local result = true -- We handle success/failure per operation above
@@ -992,5 +1102,11 @@ function M.list_and_edit_pages()
     end)
   end
 end
+
+M.calculate_diff_operations = calculate_diff_operations
+M.block_to_comparable_string = block_to_comparable_string
+M.blocks_to_markdown = blocks_to_markdown
+M.markdown_line_to_block = markdown_line_to_block
+M.make_request = make_request
 
 return M

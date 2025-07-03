@@ -129,6 +129,52 @@ _G.vim = {
           }
         }
       end
+      -- Try to parse the JSON string with a simple parser
+      local function simple_json_parse(str)
+        -- Handle the specific test cases
+        local expected_str = '{"results": [{"id": "block1", "has_children": true}, {"id": "block2"}], ' ..
+                              '"has_more": true, "next_cursor": "cursor1"}'
+        if str == expected_str then
+          return {
+            results = {
+              { id = "block1", has_children = true },
+              { id = "block2" }
+            },
+            has_more = true,
+            next_cursor = "cursor1"
+          }
+        elseif str == '{"results": [{"id": "block3"}]}' then
+          return {
+            results = {
+              { id = "block3" }
+            }
+          }
+        elseif str == '{"results": []}' then
+          return {
+            results = {}
+          }
+        elseif str == '{"results": [{"id": "block1"}, {"id": "block2"}]}' then
+          return {
+            results = {
+              { id = "block1" },
+              { id = "block2" }
+            }
+          }
+        elseif str == '{"results": [{"id": "block1", "in_trash": true}, {"id": "block2"}]}' then
+          return {
+            results = {
+              { id = "block1", in_trash = true },
+              { id = "block2" }
+            }
+          }
+        end
+        return nil
+      end
+
+      local parsed = simple_json_parse(json_string)
+      if parsed then
+        return parsed
+      end
       -- Default fallback
       return { success = true }
     end

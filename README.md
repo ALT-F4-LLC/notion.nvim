@@ -30,11 +30,12 @@ A Neovim plugin for seamless integration with Notion's API, allowing you to edit
 ## Features
 
 - **Native Notion editing** - Edit Notion pages directly in Neovim buffers
-- **Intelligent sync** - Diff-based synchronization that only updates changed content
+- **Robust sync system** - Diff-based synchronization with intelligent pagination and retry logic
 - **Markdown support** - Full markdown syntax with rich text formatting (bold, italic, code, links)
 - **Smart debouncing** - Prevents API abuse with configurable sync delays
 - **Image support** - Embed and edit images with captions using markdown syntax
 - **Block preservation** - Maintains Notion block structure and ordering
+- **Rate limiting handling** - Automatic retry logic for API rate limits
 - **Cross-platform** - Works on macOS, Linux, and Windows
 - **Debug mode** - Detailed timing information for performance analysis
 
@@ -161,20 +162,23 @@ When you edit a Notion page:
    - ````code blocks````
    - `![caption](url)` images
 
-3. **Intelligent sync** - Only modified blocks are updated, preserving unchanged content
+3. **Robust sync** - Only modified blocks are updated with automatic retry on failures
 4. **Instant feedback** - Success/error notifications after each save
 
 ### Performance
 
-The plugin uses a sophisticated diff algorithm that:
-- **Compares existing vs new content** to identify changes
-- **Only updates modified blocks** (typically <1 second for small changes)
+The plugin uses a sophisticated sync system that:
+- **Intelligent pagination** - Handles large documents by fetching all blocks efficiently
+- **Compares existing vs new content** to identify changes with precise diff algorithm
+- **Only updates modified blocks** with automatic retry on API failures
 - **Preserves block order** using Notion's positioning API
-- **Scales efficiently** with document size
+- **Scales efficiently** with document size through smart pagination
+- **Rate limiting resilience** - Automatic backoff and retry for API limits
 
 Typical sync times:
 - Small edits (1-2 blocks): 200-800ms
 - Large documents: Performance scales with changed content, not total size
+- Pagination and retries add minimal overhead while ensuring reliability
 
 ## Environment Variables
 
@@ -213,6 +217,12 @@ Debug output shows:
 4. **Slow sync performance**
    - Enable debug mode to see timing breakdown
    - Performance depends on Notion API response time (typically 200-600ms per request)
+   - Large pages may require multiple API calls due to pagination (normal behavior)
+
+5. **Temporary sync failures**
+   - Plugin automatically retries failed requests once
+   - Rate limiting is handled with intelligent backoff
+   - Enable debug mode to see retry attempts and timing
 
 ## API Reference
 
@@ -249,12 +259,13 @@ notion.open_page_by_url('https://notion.so/...')
 
 ### Sync Algorithm
 
-1. **Fetch existing blocks** from Notion page
+1. **Fetch existing blocks** from Notion page with intelligent pagination
 2. **Convert buffer content** to Notion block format
-3. **Calculate diff** between existing and new blocks
+3. **Calculate precise diff** between existing and new blocks
 4. **Delete changed blocks** that no longer match
 5. **Insert new blocks** at correct positions using `after` parameter
 6. **Preserve unchanged blocks** for optimal performance
+7. **Retry on failures** with automatic backoff for rate limiting
 
 ### Block Type Support
 
@@ -266,12 +277,15 @@ notion.open_page_by_url('https://notion.so/...')
 - `code` - Code blocks with language detection
 - `image` - Images with captions (both external URLs and Notion-hosted files)
 
-### Rate Limiting
+### Rate Limiting & Reliability
 
-Built-in debouncing prevents API abuse:
-- Minimum time between syncs (default: 1000ms)
-- Per-page sync state tracking
-- Graceful handling of rapid save attempts
+Built-in protection against API limits and failures:
+- **Debouncing** - Minimum time between syncs (default: 1000ms)
+- **Per-page sync state tracking** - Prevents concurrent syncs
+- **Graceful handling** of rapid save attempts
+- **Automatic retry logic** - Intelligent backoff for API rate limits
+- **Pagination handling** - Efficiently fetches all blocks from large pages
+- **Failure recovery** - Retry mechanisms for temporary API issues
 
 ## License
 

@@ -34,6 +34,19 @@ describe("api", function()
     package.preload['notion.config'] = function() return mock_config end
     package.preload['plenary.curl'] = function() return mock_curl end
 
+    vim.split = function(str, sep)
+      local result = {}
+      for s in str:gmatch("([^" .. sep .. "]+)") do
+        table.insert(result, s)
+      end
+      return result
+    end
+
+    vim.loop = {
+      sleep = function() end,
+      hrtime = function() return 0 end
+    }
+
     api = require('notion.api')
   end)
 
@@ -43,38 +56,32 @@ describe("api", function()
     package.preload['plenary.curl'] = nil
   end)
 
-  describe("rich_text_to_markdown", function()
-    it("should convert simple text", function()
-      -- We need to access the internal function, but since it's local,
-      -- we'll test it through the blocks_to_markdown function
-      local blocks = {
-        {
-          type = "paragraph",
-          paragraph = {
-            rich_text = {
-              { text = { content = "Hello world" } }
-            }
-          }
-        }
-      }
-
-      -- This tests the internal function indirectly
-      assert.is_not_nil(blocks)
-    end)
-  end)
 
   describe("markdown_line_to_block", function()
-    -- Test through markdown_to_blocks since the function is local
-    it("should handle headings", function()
-      -- Testing indirectly by checking that the module loads without error
-      assert.is_not_nil(api)
+    it("should handle to-do blocks", function()
+      local block_checked = api.markdown_line_to_block("- [x] task")
+      local block_unchecked = api.markdown_line_to_block("- [ ] task")
+
+      assert.is_true(block_checked.to_do.checked)
+      assert.is_false(block_unchecked.to_do.checked)
     end)
   end)
 
   describe("block_to_comparable_string", function()
-    -- This is a local function, so we test it indirectly
-    it("should be testable through sync functionality", function()
-      assert.is_not_nil(api)
+    it("should handle to-do blocks", function()
+      local block_checked = {
+        type = "to_do",
+        to_do = { checked = true, rich_text = { { text = { content = "task" } } } }
+      }
+      local block_unchecked = {
+        type = "to_do",
+        to_do = { checked = false, rich_text = { { text = { content = "task" } } } }
+      }
+
+      local comparable_checked = api.block_to_comparable_string(block_checked)
+      local comparable_unchecked = api.block_to_comparable_string(block_unchecked)
+
+      assert.is_not.equal(comparable_checked, comparable_unchecked)
     end)
   end)
 
@@ -193,24 +200,18 @@ describe("api", function()
     end)
   end)
 
-  describe("parse_rich_text", function()
-    -- This is tested indirectly through the markdown parsing functions
-    it("should be part of the module", function()
-      assert.is_not_nil(api)
-    end)
-  end)
-
-  describe("markdown_to_blocks", function()
-    -- This is tested indirectly since it's a local function
-    it("should be part of the module", function()
-      assert.is_not_nil(api)
-    end)
-  end)
 
   describe("blocks_to_markdown", function()
-    -- This is tested indirectly since it's a local function
-    it("should be part of the module", function()
-      assert.is_not_nil(api)
+    it("should handle multiline code blocks", function()
+      local blocks = {
+        { type = "code", code = { rich_text = { { text = { content = "line1\nline2" } } }, language = "lua" } }
+      }
+      local markdown = api.blocks_to_markdown(blocks)
+      assert.equals(4, #markdown)
+      assert.equals("```lua", markdown[1])
+      assert.equals("line1", markdown[2])
+      assert.equals("line2", markdown[3])
+      assert.equals("```", markdown[4])
     end)
   end)
 
@@ -438,6 +439,201 @@ describe("api", function()
       -- Verify the Bearer token is sanitized
       assert.is_nil(string.match(notifications[1].msg, test_token))
       assert.is_not_nil(string.match(notifications[1].msg, "Bearer %[REDACTED%]"))
+    end)
+
+    it("should handle pagination", function()
+      local call_count = 0
+      api.make_request = spy.new(function(method, endpoint, data)
+        call_count = call_count + 1
+        if call_count == 1 then
+          return {
+            results = { { id = "block1" } },
+            has_more = true,
+            next_cursor = "cursor1"
+          }
+        else
+          return {
+            results = { { id = "block2" } }
+          }
+        end
+      end)
+
+      local blocks = api.get_all_blocks("page1")
+
+      assert.equals(2, #blocks)
+      assert.equals("block1", blocks[1].id)
+      assert.equals("block2", blocks[2].id)
+    end)
+
+    it("should handle rate limiting", function()
+      local call_count = 0
+      api.make_request = spy.new(function(method, endpoint, data)
+        call_count = call_count + 1
+        if call_count == 1 then
+          return nil
+        else
+          return {
+            results = { { id = "block1" } }
+          }
+        end
+      end)
+
+      local notifications = {}
+      vim.notify = function(msg, level)
+        table.insert(notifications, { msg = msg, level = level })
+      end
+
+      local blocks = api.get_all_blocks("page1")
+
+      assert.equals(1, #blocks)
+      assert.equals("block1", blocks[1].id)
+    end)
+  end)
+
+  describe("calculate_diff_operations", function()
+    it("should detect no changes", function()
+      local existing_blocks = {
+        { id = "block1", type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } }
+      }
+      local new_blocks = {
+        { type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } }
+      }
+
+      local operations = api.calculate_diff_operations(existing_blocks, new_blocks)
+
+      assert.equals(0, #operations.updates)
+      assert.equals(0, #operations.deletes)
+      assert.equals(0, #operations.inserts)
+      assert.equals(1, operations.noops)
+    end)
+
+    it("should detect updates", function()
+      local existing_blocks = {
+        { id = "block1", type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } }
+      }
+      local new_blocks = {
+        { type = "paragraph", paragraph = { rich_text = { { text = { content = "world" } } } } }
+      }
+
+      local operations = api.calculate_diff_operations(existing_blocks, new_blocks)
+
+      assert.equals(1, #operations.updates)
+      assert.equals(0, #operations.deletes)
+      assert.equals(0, #operations.inserts)
+      assert.equals(0, operations.noops)
+      assert.equals("block1", operations.updates[1].block_id)
+    end)
+
+    it("should detect deletions", function()
+      local existing_blocks = {
+        { id = "block1", type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } }
+      }
+      local new_blocks = {}
+
+      local operations = api.calculate_diff_operations(existing_blocks, new_blocks)
+
+      assert.equals(0, #operations.updates)
+      assert.equals(1, #operations.deletes)
+      assert.equals(0, #operations.inserts)
+      assert.equals(0, operations.noops)
+      assert.equals("block1", operations.deletes[1].block_id)
+    end)
+
+    it("should detect insertions", function()
+      local existing_blocks = {}
+      local new_blocks = {
+        { type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } }
+      }
+
+      local operations = api.calculate_diff_operations(existing_blocks, new_blocks)
+
+      assert.equals(0, #operations.updates)
+      assert.equals(0, #operations.deletes)
+      assert.equals(1, #operations.inserts)
+      assert.equals(0, operations.noops)
+      assert.equals(1, #operations.inserts[1].children)
+    end)
+
+    it("should handle mixed operations", function()
+      local existing_blocks = {
+        { id = "block1", type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } },
+        { id = "block2", type = "paragraph", paragraph = { rich_text = { { text = { content = "world" } } } } }
+      }
+      local new_blocks = {
+        { type = "paragraph", paragraph = { rich_text = { { text = { content = "hello" } } } } },
+        { type = "heading_1", heading_1 = { rich_text = { { text = { content = "world" } } } } }
+      }
+
+      local operations = api.calculate_diff_operations(existing_blocks, new_blocks)
+
+      assert.equals(0, #operations.updates)
+      assert.equals(1, #operations.deletes)
+      assert.equals(1, #operations.inserts)
+      assert.equals(1, operations.noops)
+      assert.equals("block2", operations.deletes[1].block_id)
+      assert.equals(1, #operations.inserts[1].children)
+    end)
+  end)
+
+  describe("get_all_blocks", function()
+    it("should recursively fetch all blocks", function()
+      local call_count = 0
+      mock_curl.get = spy.new(function(opts)
+        call_count = call_count + 1
+        if call_count == 1 then
+          return {
+            status = 200,
+            body = '{"results": [{"id": "block1", "has_children": true}, {"id": "block2"}], ' ..
+                   '"has_more": true, "next_cursor": "cursor1"}'
+          }
+        elseif call_count == 2 then
+          return {
+            status = 200,
+            body = '{"results": [{"id": "block3"}]}'
+          }
+        else
+          return {
+            status = 200,
+            body = '{"results": []}'
+          }
+        end
+      end)
+
+      local blocks = api.get_all_blocks("page1")
+
+      assert.equals(3, #blocks)
+      assert.equals("block1", blocks[1].id)
+      assert.equals("block3", blocks[2].id)
+      assert.equals("block2", blocks[3].id)
+    end)
+
+    it("should handle blocks with no children", function()
+      mock_curl.get = spy.new(function(opts)
+        return {
+          status = 200,
+          body = '{"results": [{"id": "block1"}, {"id": "block2"}]}'
+        }
+      end)
+
+      local blocks = api.get_all_blocks("page1")
+
+      assert.equals(2, #blocks)
+      assert.equals("block1", blocks[1].id)
+      assert.equals("block2", blocks[2].id)
+    end)
+
+    it("should handle archived blocks", function()
+      mock_curl.get = spy.new(function(opts)
+        return {
+          status = 200,
+          body = '{"results": [{"id": "block1", "in_trash": true}, {"id": "block2"}]}'
+        }
+      end)
+
+      local blocks = api.get_all_blocks("page1")
+
+      assert.equals(1, #blocks)
+      assert.equals("block2", blocks[1].id)
     end)
   end)
 end)

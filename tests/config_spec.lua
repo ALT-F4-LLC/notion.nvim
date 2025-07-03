@@ -181,4 +181,18 @@ describe("config", function()
       assert.is_true(found_command_error, "Should have command failure notification")
     end)
   end)
+
+  describe("last_sync", function()
+    it("should get and set last sync time", function()
+      local page_id = "test_page_id"
+      local timestamp = os.time()
+
+      config.set_last_sync(page_id, timestamp)
+      assert.equals(timestamp, config.get_last_sync(page_id))
+    end)
+
+    it("should return nil for a page that has not been synced", function()
+      assert.is_nil(config.get_last_sync("non_existent_page"))
+    end)
+  end)
 end)
