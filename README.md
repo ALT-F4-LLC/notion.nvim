@@ -17,6 +17,7 @@ A Neovim plugin for seamless integration with Notion's API, allowing you to edit
 - **Robust sync system** - Diff-based synchronization with intelligent pagination and retry logic
 - **Markdown support** - Full markdown syntax with rich text formatting (bold, italic, code, links)
 - **Smart debouncing** - Prevents API abuse with configurable sync delays
+- **Enhanced Telescope integration** - Article preview with caching and fuzzy search (requires telescope.nvim)
 - **Image support** - Embed and edit images with captions using markdown syntax
 - **Block preservation** - Maintains Notion block structure and ordering
 - **Rate limiting handling** - Automatic retry logic for API rate limits
@@ -85,11 +86,20 @@ require('notion').setup({
 
 ### Telescope Integration
 
-If [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) is installed, the plugin will use it for page browsing instead of `vim.ui.select`. This provides:
-- **Fuzzy search** across all page titles
-- **Preview pane** showing page metadata (URL, timestamps, ID)
-- **Pagination support** - automatically fetches and displays all pages from your database
-- **Better UX** for large databases with hundreds of pages
+If [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) is installed, the plugin uses it for enhanced page browsing instead of `vim.ui.select`. This provides:
+
+- **Full article preview** - See complete article content in markdown format as you browse
+- **Smart caching** - Previewed articles load instantly when you return to them
+- **Debounced loading** - 300ms delay prevents freezing when scrolling quickly through articles
+- **Fuzzy search** - Fast filtering across all page titles
+- **Pagination support** - Automatically fetches and displays all pages from your database
+- **Alphabetical sorting** - Pages displayed in A-Z order by title
+
+**Preview behavior:**
+- Articles load after 300ms pause (prevents API spam while scrolling)
+- Cached articles display instantly with no delay
+- Only one article loads at a time to prevent UI freezing
+- Shows "Loading..." indicator while fetching large articles
 
 The integration auto-detects Telescope availability. You can override this behavior:
 - `use_telescope = nil` - Auto-detect (default, recommended)
@@ -129,7 +139,7 @@ require('notion').setup({
 ### Core Workflow
 
 1. **Create pages**: `:Notion create <title>` - Create and immediately edit new pages
-2. **Browse and edit**: `:Notion edit` - Select from all pages to edit (with fuzzy search if Telescope is installed)
+2. **Browse and edit**: `:Notion edit` - Browse pages with live preview and fuzzy search (requires Telescope) or simple selection menu
 3. **Save changes**: `:w` - Automatically syncs changes back to Notion
 4. **Delete pages**: `:Notion delete` - Browse and archive pages
 5. **Open in browser**: `:NotionBrowser` - Open current page in browser
@@ -256,6 +266,9 @@ notion.open_current_page_in_browser()
 notion.open_page('search query')
 notion.list_pages()
 notion.open_page_by_url('https://notion.so/...')
+
+-- Clear preview cache (useful after making changes outside Neovim)
+require('notion.telescope').clear_preview_cache()
 ```
 
 ## Technical Details
