@@ -1137,6 +1137,11 @@ function M.list_and_edit_pages()
     return
   end
 
+  -- Sort pages alphabetically by title (case-insensitive)
+  table.sort(pages, function(a, b)
+    return a.title:lower() < b.title:lower()
+  end)
+
   vim.notify(string.format('Found %d pages', #pages), vim.log.levels.INFO)
 
   -- Callback when page is selected
