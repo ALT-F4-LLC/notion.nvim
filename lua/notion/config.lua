@@ -7,6 +7,7 @@ M.defaults = {
   cache_ttl = 300,
   debug = false, -- Set to true to show timing information
   sync_debounce_ms = 1000, -- Minimum time between syncs (ms)
+  use_telescope = nil, -- nil = auto-detect, true = force telescope, false = force vim.ui.select
 }
 
 M.options = {}
@@ -94,6 +95,19 @@ end
 
 function M.set_last_sync(page_id, timestamp)
   M.options['last_sync_' .. page_id] = timestamp
+end
+
+function M.telescope_available()
+  local ok = pcall(require, 'telescope')
+  return ok
+end
+
+function M.should_use_telescope()
+  local use_telescope = M.options.use_telescope
+  if use_telescope == nil then
+    return M.telescope_available()  -- Auto-detect
+  end
+  return use_telescope
 end
 
 return M

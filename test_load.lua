@@ -31,7 +31,8 @@ local function unload_plugin()
         'notion',
         'notion.api',
         'notion.config',
-        'notion.init'
+        'notion.init',
+        'notion.telescope'
     }
 
     for _, module in ipairs(modules_to_clear) do
@@ -96,6 +97,15 @@ local function load_local_plugin()
     local api = load_local_module('notion/api.lua', 'notion.api')
     print("✓ Loaded notion.api from local file")
 
+    -- Load telescope module (if telescope is available)
+    local telescope_ok = pcall(require, 'telescope')
+    if telescope_ok then
+      local telescope_module = load_local_module('notion/telescope.lua', 'notion.telescope')
+      print("✓ Loaded notion.telescope from local file")
+    else
+      print("⚠ Telescope not installed, notion.telescope will not be available")
+    end
+
     -- Load init/main
     local init = load_local_module('notion/init.lua', 'notion.init')
     local notion = load_local_module('notion.lua', 'notion')
@@ -105,6 +115,7 @@ local function load_local_plugin()
     notion.setup({
         debug = true,       -- Enable debug mode for testing
         sync_debounce_ms = 500, -- Faster sync for testing
+        use_telescope = true, -- Force Telescope usage, will warn if unavailable
     })
 
     -- Load the plugin file that defines the main :Notion command

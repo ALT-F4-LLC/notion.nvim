@@ -17,6 +17,7 @@ A Neovim plugin for seamless integration with Notion's API, allowing you to edit
 - **Robust sync system** - Diff-based synchronization with intelligent pagination and retry logic
 - **Markdown support** - Full markdown syntax with rich text formatting (bold, italic, code, links)
 - **Smart debouncing** - Prevents API abuse with configurable sync delays
+- **Enhanced Telescope integration** - Article preview with caching and fuzzy search (requires telescope.nvim)
 - **Image support** - Embed and edit images with captions using markdown syntax
 - **Block preservation** - Maintains Notion block structure and ordering
 - **Rate limiting handling** - Automatic retry logic for API rate limits
@@ -27,6 +28,7 @@ A Neovim plugin for seamless integration with Notion's API, allowing you to edit
 
 - Neovim 0.8+
 - [plenary.nvim](https://github.com/nvim-lua/plenary.nvim)
+- [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) (optional, recommended for better page browsing)
 - Notion API integration token
 - Notion database ID
 
@@ -37,7 +39,10 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 ```lua
 {
   'ALT-F4-LLC/notion.nvim',
-  dependencies = { 'nvim-lua/plenary.nvim' },
+  dependencies = {
+    'nvim-lua/plenary.nvim',
+    'nvim-telescope/telescope.nvim',  -- Optional but recommended
+  },
   config = function()
     require('notion').setup({
       -- Secure token retrieval (recommended)
@@ -46,6 +51,7 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
       database_id = 'your_database_id_here',   -- or set NOTION_DATABASE_ID env var
       debug = false,                          -- Enable debug timing info
       sync_debounce_ms = 1000,               -- Minimum time between syncs
+      use_telescope = nil,                   -- nil = auto-detect, true = force, false = disable
     })
   end
 }
@@ -71,11 +77,34 @@ https://www.notion.so/workspace/DATABASE_ID?v=...
 require('notion').setup({
   notion_token_cmd = nil,     -- Command to retrieve token (e.g. {"doppler", "secrets", "get", "--plain", "NOTION_TOKEN"})
   database_id = nil,          -- Database ID (or use NOTION_DATABASE_ID env var)
-  page_size = 10,             -- Number of pages to retrieve in lists
+  page_size = 10,             -- Number of pages per API request (pagination fetches all)
   debug = false,              -- Show detailed timing information
   sync_debounce_ms = 1000,    -- Minimum milliseconds between syncs (prevents API abuse)
+  use_telescope = nil,        -- nil = auto-detect, true = force telescope, false = use vim.ui.select
 })
 ```
+
+### Telescope Integration
+
+If [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) is installed, the plugin uses it for enhanced page browsing instead of `vim.ui.select`. This provides:
+
+- **Full article preview** - See complete article content in markdown format as you browse
+- **Smart caching** - Previewed articles load instantly when you return to them
+- **Debounced loading** - 300ms delay prevents freezing when scrolling quickly through articles
+- **Fuzzy search** - Fast filtering across all page titles
+- **Pagination support** - Automatically fetches and displays all pages from your database
+- **Alphabetical sorting** - Pages displayed in A-Z order by title
+
+**Preview behavior:**
+- Articles load after 300ms pause (prevents API spam while scrolling)
+- Cached articles display instantly with no delay
+- Only one article loads at a time to prevent UI freezing
+- Shows "Loading..." indicator while fetching large articles
+
+The integration auto-detects Telescope availability. You can override this behavior:
+- `use_telescope = nil` - Auto-detect (default, recommended)
+- `use_telescope = true` - Force Telescope (warns if unavailable, falls back to vim.ui.select)
+- `use_telescope = false` - Always use vim.ui.select
 
 ### Token Security
 
@@ -110,7 +139,7 @@ require('notion').setup({
 ### Core Workflow
 
 1. **Create pages**: `:Notion create <title>` - Create and immediately edit new pages
-2. **Browse and edit**: `:Notion edit` - Select from existing pages to edit
+2. **Browse and edit**: `:Notion edit` - Browse pages with live preview and fuzzy search (requires Telescope) or simple selection menu
 3. **Save changes**: `:w` - Automatically syncs changes back to Notion
 4. **Delete pages**: `:Notion delete` - Browse and archive pages
 5. **Open in browser**: `:NotionBrowser` - Open current page in browser
@@ -237,39 +266,115 @@ notion.open_current_page_in_browser()
 notion.open_page('search query')
 notion.list_pages()
 notion.open_page_by_url('https://notion.so/...')
+
+-- Clear preview cache (useful after making changes outside Neovim)
+require('notion.telescope').clear_preview_cache()
 ```
 
-## Technical Details
+## Contributing
 
-### Sync Algorithm
+We welcome contributions to notion.nvim! Whether you're fixing bugs, adding features, or improving documentation, your help is appreciated.
 
-1. **Fetch existing blocks** from Notion page with intelligent pagination
-2. **Convert buffer content** to Notion block format
-3. **Calculate precise diff** between existing and new blocks
-4. **Delete changed blocks** that no longer match
-5. **Insert new blocks** at correct positions using `after` parameter
-6. **Preserve unchanged blocks** for optimal performance
-7. **Retry on failures** with automatic backoff for rate limiting
+### Development Setup
 
-### Block Type Support
+1. **Clone the repository**
+```bash
+git clone https://github.com/ALT-F4-LLC/notion.nvim.git
+cd notion.nvim
+```
 
-- `heading_1`, `heading_2`, `heading_3` - Markdown headers
-- `paragraph` - Regular text with rich formatting
-- `bulleted_list_item` - Bulleted lists
-- `numbered_list_item` - Numbered lists
-- `to_do` - Checkbox items
-- `code` - Code blocks with language detection
-- `image` - Images with captions (both external URLs and Notion-hosted files)
+2. **Install dependencies**
 
-### Rate Limiting & Reliability
+**Option 1: Using Nix (Recommended)**
+```bash
+nix develop  # Provides lua, busted, luacheck, luacov, and all dependencies
+```
 
-Built-in protection against API limits and failures:
-- **Debouncing** - Minimum time between syncs (default: 1000ms)
-- **Per-page sync state tracking** - Prevents concurrent syncs
-- **Graceful handling** of rapid save attempts
-- **Automatic retry logic** - Intelligent backoff for API rate limits
-- **Pagination handling** - Efficiently fetches all blocks from large pages
-- **Failure recovery** - Retry mechanisms for temporary API issues
+**Option 2: Manual installation**
+- Install Lua 5.4+ or LuaJIT
+- Install [busted](https://github.com/lunarmodules/busted) for testing
+- Install [luacheck](https://github.com/mpeterv/luacheck) for linting
+- Install [plenary.nvim](https://github.com/nvim-lua/plenary.nvim)
+
+3. **Set up test environment**
+```bash
+# Set up Notion API credentials for testing (optional)
+export NOTION_TOKEN="your_test_integration_token"
+export NOTION_DATABASE_ID="your_test_database_id"
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+make test
+
+# Run tests with coverage report
+make test-coverage
+
+# Watch mode (auto-run tests on file changes)
+make test-watch
+
+# Run tests directly with busted
+busted --helper=tests/spec_helper.lua
+```
+
+### Linting
+
+```bash
+# Lint all Lua code
+make lint
+
+# Or run luacheck directly
+luacheck lua/ tests/ --globals vim
+```
+
+### Making Changes
+
+1. **Create a branch** for your feature or bugfix
+```bash
+git checkout -b feature/your-feature-name
+```
+
+2. **Write tests** for your changes
+
+- Add tests in `tests/` directory
+- Follow existing test patterns in `*_spec.lua` files
+- Ensure all tests pass with `make test`
+
+3. **Follow code style**
+
+- Use 2-space indentation
+- Run `make lint` to check for issues
+- Write clear, descriptive commit messages
+
+4. **Update documentation**
+
+- Update README.md if adding user-facing features
+- Add inline comments for complex logic
+
+### Submitting Pull Requests
+
+1. **Ensure all tests pass** (`make test`)
+2. **Ensure linting passes** (`make lint`)
+3. **Create a pull request** with:
+- Clear description of changes
+- Link to related issues (if any)
+- Screenshots/examples for UI changes
+
+### Development Resources
+
+- **Issues**: [GitHub Issues](https://github.com/ALT-F4-LLC/notion.nvim/issues)
+
+### Testing with Your Notion Database
+
+For local testing with real Notion API:
+1. Create a test integration at https://www.notion.so/my-integrations
+2. Create a test database and share it with your integration
+3. Set `NOTION_TOKEN` and `NOTION_DATABASE_ID` environment variables
+4. Run `:Notion edit` in Neovim to test the plugin
+
+**Note**: The test suite uses mocked API responses, so you don't need real credentials to run tests.
 
 ## License
 
