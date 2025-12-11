@@ -19,7 +19,10 @@
         ...
       }: {
         packages.notion-nvim = pkgs.vimUtils.buildVimPlugin {
-          dependencies = with pkgs.vimPlugins; [telescope-nvim penary-nvim];
+          dependencies = with pkgs.vimPlugins; [
+            telescope-nvim
+            plenary-nvim
+          ];
           name = "notion-nvim";
           version = "unstable";
           src = ./.;
