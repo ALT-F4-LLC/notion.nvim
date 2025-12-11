@@ -8,10 +8,12 @@ describe("Telescope integration", function()
   before_each(function()
     reset_vim_mocks()
 
-    -- Reset module cache
+    -- Reset module cache AND preload (to clear mocks from other tests)
     package.loaded['notion.api'] = nil
     package.loaded['notion.config'] = nil
     package.loaded['plenary.curl'] = nil
+    package.preload['notion.api'] = nil
+    package.preload['notion.config'] = nil
 
     -- Mock curl
     mock_curl = {
@@ -360,7 +362,7 @@ describe("Telescope integration", function()
 
       api.list_and_edit_pages()
       assert.is_true(#warnings > 0)
-      assert.is_true(warnings[1]:match("Telescope not available"))
+      assert.is_not_nil(warnings[1]:match("Telescope not available"))
     end)
 
     it("shows page count notification", function()
@@ -373,7 +375,7 @@ describe("Telescope integration", function()
 
       api.list_and_edit_pages()
       assert.is_true(#notifications > 0)
-      assert.is_true(notifications[1]:match("Found 2 pages"))
+      assert.is_not_nil(notifications[1]:match("Found 2 pages"))
     end)
 
     it("handles empty database", function()
@@ -396,7 +398,7 @@ describe("Telescope integration", function()
 
       api.list_and_edit_pages()
       assert.is_true(#warnings > 0)
-      assert.is_true(warnings[1]:match("No pages found"))
+      assert.is_not_nil(warnings[1]:match("No pages found"))
     end)
 
     it("handles missing database_id", function()
@@ -411,7 +413,7 @@ describe("Telescope integration", function()
 
       api.list_and_edit_pages()
       assert.is_true(#errors > 0)
-      assert.is_true(errors[1]:match("Database ID not configured"))
+      assert.is_not_nil(errors[1]:match("Database ID not configured"))
     end)
   end)
 end)

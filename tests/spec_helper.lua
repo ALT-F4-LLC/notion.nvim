@@ -87,19 +87,58 @@ _G.vim = {
 
   json = {
     encode = function(data)
-      -- Simple JSON encoder for testing
-      if type(data) == "table" then
-        return "{}"
-      else
-        return tostring(data)
+      -- Simple JSON encoder for testing that actually works
+      local function encode_value(val)
+        local val_type = type(val)
+        if val_type == "string" then
+          return '"' .. val:gsub('"', '\\"') .. '"'
+        elseif val_type == "number" then
+          return tostring(val)
+        elseif val_type == "boolean" then
+          return tostring(val)
+        elseif val_type == "nil" then
+          return "null"
+        elseif val_type == "table" then
+          -- Check if it's an array (all keys are sequential numbers starting from 1)
+          local is_array = true
+          local max_index = 0
+          for k, _ in pairs(val) do
+            if type(k) ~= "number" or k < 1 or k ~= math.floor(k) then
+              is_array = false
+              break
+            end
+            max_index = math.max(max_index, k)
+          end
+
+          if is_array and max_index == #val then
+            -- Encode as array
+            local parts = {}
+            for i = 1, #val do
+              table.insert(parts, encode_value(val[i]))
+            end
+            return "[" .. table.concat(parts, ", ") .. "]"
+          else
+            -- Encode as object
+            local parts = {}
+            for k, v in pairs(val) do
+              local key = type(k) == "string" and k or tostring(k)
+              table.insert(parts, '"' .. key .. '": ' .. encode_value(v))
+            end
+            return "{" .. table.concat(parts, ", ") .. "}"
+          end
+        else
+          return "null"
+        end
       end
+      return encode_value(data)
     end,
     decode = function(json_string)
-      -- Simple JSON decoder for testing that actually parses basic JSON
+      -- Simple JSON decoder for testing that actually parses JSON
       if type(json_string) ~= "string" then
         return { success = true }
       end
-      -- Handle image test data
+
+      -- Handle legacy pattern-based test data (for backward compatibility)
       if json_string:match('page%-with%-properties%-Test Page') then
         return {
           properties = {
@@ -170,52 +209,34 @@ _G.vim = {
           }
         }
       end
-      -- Try to parse the JSON string with a simple parser
-      local function simple_json_parse(str)
-        -- Handle the specific test cases
-        local expected_str = '{"results": [{"id": "block1", "has_children": true}, {"id": "block2"}], ' ..
-                              '"has_more": true, "next_cursor": "cursor1"}'
-        if str == expected_str then
-          return {
-            results = {
-              { id = "block1", has_children = true },
-              { id = "block2" }
-            },
-            has_more = true,
-            next_cursor = "cursor1"
-          }
-        elseif str == '{"results": [{"id": "block3"}]}' then
-          return {
-            results = {
-              { id = "block3" }
-            }
-          }
-        elseif str == '{"results": []}' then
-          return {
-            results = {}
-          }
-        elseif str == '{"results": [{"id": "block1"}, {"id": "block2"}]}' then
-          return {
-            results = {
-              { id = "block1" },
-              { id = "block2" }
-            }
-          }
-        elseif str == '{"results": [{"id": "block1", "in_trash": true}, {"id": "block2"}]}' then
-          return {
-            results = {
-              { id = "block1", in_trash = true },
-              { id = "block2" }
-            }
-          }
+
+      -- Try to use a real JSON parser if available (dkjson or cjson)
+      local has_dkjson, dkjson = pcall(require, "dkjson")
+      if has_dkjson then
+        local obj = dkjson.decode(json_string, 1, nil)
+        if obj then
+          return obj
         end
-        return nil
       end
 
-      local parsed = simple_json_parse(json_string)
-      if parsed then
-        return parsed
+      -- Fallback: try to load the string as Lua code (UNSAFE in production, but OK for tests)
+      -- Convert JSON to Lua table syntax
+      local lua_str = json_string
+        :gsub("%[", "{")
+        :gsub("%]", "}")
+        :gsub("null", "nil")
+        :gsub('"([^"]+)":%s*', '["%1"] = ')
+        :gsub('true', 'true')
+        :gsub('false', 'false')
+
+      local fn = load("return " .. lua_str)
+      if fn then
+        local ok, result = pcall(fn)
+        if ok then
+          return result
+        end
       end
+
       -- Default fallback
       return { success = true }
     end
