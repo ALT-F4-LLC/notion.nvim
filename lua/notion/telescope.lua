@@ -1,5 +1,14 @@
 local M = {}
 
+-- Cache for article content: { [page_id] = markdown_string }
+local preview_cache = {}
+
+-- Debounce timer for preview loading
+local preview_timer = nil
+
+-- Currently loading page ID (prevent simultaneous loads)
+local loading_page_id = nil
+
 -- Lazy-load telescope modules only when needed
 -- This allows the module to be required even if telescope isn't installed
 local pickers, finders, conf, actions, action_state, previewers
@@ -10,7 +19,7 @@ local function ensure_telescope_loaded()
     finders = require('telescope.finders')
     conf = require('telescope.config').values
     actions = require('telescope.actions')
-    action_state = require('telescope.action_state')
+    action_state = require('telescope.actions.state')
     previewers = require('telescope.previewers')
   end
 end
@@ -37,26 +46,106 @@ local function make_entry_maker()
   end
 end
 
--- Custom previewer showing page metadata
+-- Custom previewer showing page content with caching and debouncing
 local function make_previewer()
   ensure_telescope_loaded()
 
   return previewers.new_buffer_previewer({
-    title = "Page Details",
+    title = "Page Preview",
     define_preview = function(self, entry, status)
       local page = entry.value
-      local lines = {
-        "Title: " .. page.title,
+      local bufnr = self.state.bufnr
+      local page_id = page.id
+
+      -- Cancel any pending timer
+      if preview_timer then
+        vim.fn.timer_stop(preview_timer)
+        preview_timer = nil
+      end
+
+      -- Check cache first (instant display, bypass debounce)
+      if preview_cache[page_id] then
+        local cached_lines = vim.split(preview_cache[page_id], '\n')
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, cached_lines)
+        vim.api.nvim_buf_set_option(bufnr, 'filetype', 'markdown')
+        return
+      end
+
+      -- Show loading message immediately
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+        "# " .. page.title,
         "",
-        "URL: " .. page.url,
-        "",
-        "Created: " .. format_time(page.created_time),
-        "Last Edited: " .. format_time(page.last_edited_time),
-        "",
-        "Page ID: " .. page.id,
-      }
-      vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
-      vim.api.nvim_buf_set_option(self.state.bufnr, 'filetype', 'markdown')
+        "Loading article content..."
+      })
+      vim.api.nvim_buf_set_option(bufnr, 'filetype', 'markdown')
+
+      -- Debounce: only load after user stops moving for 300ms
+      preview_timer = vim.fn.timer_start(300, function()
+        preview_timer = nil
+
+        -- Check if another article is currently loading
+        if loading_page_id then
+          -- Show "waiting" message
+          if vim.api.nvim_buf_is_valid(bufnr) then
+            vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+              "# " .. page.title,
+              "",
+              "Another article is loading...",
+              "Please wait a moment."
+            })
+          end
+          return
+        end
+
+        -- Mark this page as loading
+        loading_page_id = page_id
+
+        -- Fetch article content asynchronously
+        vim.schedule(function()
+          -- Require api module to access get_all_blocks and blocks_to_markdown
+          local api = require('notion.api')
+
+          -- Fetch blocks (this will block, but at least we're debounced)
+          local blocks = api.get_all_blocks(page_id)
+
+          -- Clear loading state
+          loading_page_id = nil
+
+          if not blocks or #blocks == 0 then
+            local no_content = {
+              "# " .. page.title,
+              "",
+              "*No content available*",
+              "",
+              "URL: " .. page.url,
+              "Created: " .. format_time(page.created_time),
+              "Last Edited: " .. format_time(page.last_edited_time),
+            }
+            local no_content_str = table.concat(no_content, '\n')
+            preview_cache[page_id] = no_content_str
+            if vim.api.nvim_buf_is_valid(bufnr) then
+              vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, no_content)
+            end
+            return
+          end
+
+          -- Convert blocks to markdown
+          local markdown_lines = api.blocks_to_markdown(blocks)
+
+          -- Add title at top
+          table.insert(markdown_lines, 1, "")
+          table.insert(markdown_lines, 1, "# " .. page.title)
+
+          -- Cache the content
+          local content = table.concat(markdown_lines, '\n')
+          preview_cache[page_id] = content
+
+          -- Update buffer (check if still valid)
+          if vim.api.nvim_buf_is_valid(bufnr) then
+            vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, markdown_lines)
+          end
+        end)
+      end)
     end,
   })
 end
@@ -65,7 +154,16 @@ end
 function M.notion_pages(pages, on_select)
   ensure_telescope_loaded()
 
-  local opts = {}
+  -- Use horizontal layout with preview on the right
+  local opts = {
+    layout_strategy = "horizontal",
+    layout_config = {
+      width = 0.95,          -- 95% of screen width
+      height = 0.90,         -- 90% of screen height
+      preview_width = 0.55,  -- Preview takes 55% of width (balance between list and preview)
+      prompt_position = "top",
+    }
+  }
 
   pickers.new(opts, {
     prompt_title = "Notion Pages",
@@ -86,6 +184,19 @@ function M.notion_pages(pages, on_select)
       return true
     end,
   }):find()
+end
+
+-- Clear preview cache (useful for forcing refresh)
+function M.clear_preview_cache()
+  preview_cache = {}
+
+  -- Cancel any pending timer
+  if preview_timer then
+    vim.fn.timer_stop(preview_timer)
+    preview_timer = nil
+  end
+
+  loading_page_id = nil
 end
 
 return M

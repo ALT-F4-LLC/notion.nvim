@@ -1156,8 +1156,14 @@ function M.list_and_edit_pages()
       telescope_picker.notion_pages(pages, on_page_selected)
       return
     else
+      -- Show the actual error message for debugging
+      local error_msg = telescope_picker or "unknown error"
       if config.get('use_telescope') == true then
+        vim.notify('notion.telescope failed to load: ' .. tostring(error_msg), vim.log.levels.ERROR)
         vim.notify('Telescope not available, falling back to vim.ui.select', vim.log.levels.WARN)
+      else
+        -- Only show fallback message if not explicitly requested
+        vim.notify('Falling back to vim.ui.select', vim.log.levels.WARN)
       end
     end
   end
