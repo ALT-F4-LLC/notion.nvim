@@ -1,11 +1,19 @@
 local M = {}
 
-local pickers = require('telescope.pickers')
-local finders = require('telescope.finders')
-local conf = require('telescope.config').values
-local actions = require('telescope.actions')
-local action_state = require('telescope.action_state')
-local previewers = require('telescope.previewers')
+-- Lazy-load telescope modules only when needed
+-- This allows the module to be required even if telescope isn't installed
+local pickers, finders, conf, actions, action_state, previewers
+
+local function ensure_telescope_loaded()
+  if not pickers then
+    pickers = require('telescope.pickers')
+    finders = require('telescope.finders')
+    conf = require('telescope.config').values
+    actions = require('telescope.actions')
+    action_state = require('telescope.action_state')
+    previewers = require('telescope.previewers')
+  end
+end
 
 -- Format ISO 8601 timestamp to readable format
 local function format_time(iso_string)
@@ -31,6 +39,8 @@ end
 
 -- Custom previewer showing page metadata
 local function make_previewer()
+  ensure_telescope_loaded()
+
   return previewers.new_buffer_previewer({
     title = "Page Details",
     define_preview = function(self, entry, status)
@@ -53,6 +63,8 @@ end
 
 -- Main Telescope picker for Notion pages
 function M.notion_pages(pages, on_select)
+  ensure_telescope_loaded()
+
   local opts = {}
 
   pickers.new(opts, {
