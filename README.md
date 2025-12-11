@@ -27,6 +27,7 @@ A Neovim plugin for seamless integration with Notion's API, allowing you to edit
 
 - Neovim 0.8+
 - [plenary.nvim](https://github.com/nvim-lua/plenary.nvim)
+- [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) (optional, recommended for better page browsing)
 - Notion API integration token
 - Notion database ID
 
@@ -37,7 +38,10 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 ```lua
 {
   'ALT-F4-LLC/notion.nvim',
-  dependencies = { 'nvim-lua/plenary.nvim' },
+  dependencies = {
+    'nvim-lua/plenary.nvim',
+    'nvim-telescope/telescope.nvim',  -- Optional but recommended
+  },
   config = function()
     require('notion').setup({
       -- Secure token retrieval (recommended)
@@ -46,6 +50,7 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
       database_id = 'your_database_id_here',   -- or set NOTION_DATABASE_ID env var
       debug = false,                          -- Enable debug timing info
       sync_debounce_ms = 1000,               -- Minimum time between syncs
+      use_telescope = nil,                   -- nil = auto-detect, true = force, false = disable
     })
   end
 }
@@ -71,11 +76,25 @@ https://www.notion.so/workspace/DATABASE_ID?v=...
 require('notion').setup({
   notion_token_cmd = nil,     -- Command to retrieve token (e.g. {"doppler", "secrets", "get", "--plain", "NOTION_TOKEN"})
   database_id = nil,          -- Database ID (or use NOTION_DATABASE_ID env var)
-  page_size = 10,             -- Number of pages to retrieve in lists
+  page_size = 10,             -- Number of pages per API request (pagination fetches all)
   debug = false,              -- Show detailed timing information
   sync_debounce_ms = 1000,    -- Minimum milliseconds between syncs (prevents API abuse)
+  use_telescope = nil,        -- nil = auto-detect, true = force telescope, false = use vim.ui.select
 })
 ```
+
+### Telescope Integration
+
+If [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) is installed, the plugin will use it for page browsing instead of `vim.ui.select`. This provides:
+- **Fuzzy search** across all page titles
+- **Preview pane** showing page metadata (URL, timestamps, ID)
+- **Pagination support** - automatically fetches and displays all pages from your database
+- **Better UX** for large databases with hundreds of pages
+
+The integration auto-detects Telescope availability. You can override this behavior:
+- `use_telescope = nil` - Auto-detect (default, recommended)
+- `use_telescope = true` - Force Telescope (warns if unavailable, falls back to vim.ui.select)
+- `use_telescope = false` - Always use vim.ui.select
 
 ### Token Security
 
@@ -110,7 +129,7 @@ require('notion').setup({
 ### Core Workflow
 
 1. **Create pages**: `:Notion create <title>` - Create and immediately edit new pages
-2. **Browse and edit**: `:Notion edit` - Select from existing pages to edit
+2. **Browse and edit**: `:Notion edit` - Select from all pages to edit (with fuzzy search if Telescope is installed)
 3. **Save changes**: `:w` - Automatically syncs changes back to Notion
 4. **Delete pages**: `:Notion delete` - Browse and archive pages
 5. **Open in browser**: `:NotionBrowser` - Open current page in browser

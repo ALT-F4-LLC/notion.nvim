@@ -3,6 +3,47 @@
 -- Add lua directory to package path
 package.path = package.path .. ";./lua/?.lua;./lua/?/init.lua"
 
+-- Store original pcall
+local original_pcall = pcall
+
+-- Override pcall to handle telescope require
+_G.pcall = function(fn, ...)
+  -- Only intercept pcall(require, 'something') calls
+  if fn == require then
+    local args = {...}
+    local module_name = args[1]
+
+    -- Check if this is pcall(require, 'telescope')
+    if module_name == 'telescope' then
+      if _G.vim and _G.vim.telescope and _G.vim.telescope.available then
+        return true, {}
+      else
+        return false, "module 'telescope' not found"
+      end
+    end
+
+    -- Check if this is pcall(require, 'notion.telescope')
+    if module_name == 'notion.telescope' then
+      if _G.vim and _G.vim.telescope and _G.vim.telescope.available then
+        -- Return a mock telescope picker module
+        return true, {
+          notion_pages = function(pages, on_select)
+            -- Mock implementation - just select first page
+            if #pages > 0 then
+              on_select(pages[1])
+            end
+          end
+        }
+      else
+        return false, "module 'notion.telescope' not found"
+      end
+    end
+  end
+
+  -- Default behavior for all other cases
+  return original_pcall(fn, ...)
+end
+
 -- Mock vim global
 _G.vim = {
   log = {
@@ -214,6 +255,10 @@ _G.vim = {
         on_choice(items[1])
       end
     end
+  },
+
+  telescope = {
+    available = false,  -- Override in individual tests
   },
 
   loop = {

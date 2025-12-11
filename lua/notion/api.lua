@@ -185,6 +185,66 @@ function M.get_all_blocks(block_id)
   return all_blocks
 end
 
+-- Fetch all pages from database with pagination support
+function M.get_all_pages(database_id, page_size)
+  local all_pages = {}
+  local next_cursor = nil
+  local request_count = 0
+  local max_requests = 100  -- Safety limit to prevent infinite loops
+
+  repeat
+    local data = {
+      page_size = page_size or config.get('page_size') or 10
+    }
+
+    if next_cursor then
+      data.start_cursor = next_cursor
+    end
+
+    local result = make_request('POST', '/databases/' .. database_id .. '/query', data)
+
+    if result == nil then
+      -- Retry once on failure
+      result = make_request('POST', '/databases/' .. database_id .. '/query', data)
+    end
+
+    if result and result.results then
+      for _, page in ipairs(result.results) do
+        local title = 'Untitled'
+        if page.properties.Name and page.properties.Name.title and #page.properties.Name.title > 0 then
+          title = page.properties.Name.title[1].text.content
+        end
+        table.insert(all_pages, {
+          id = page.id,
+          title = title,
+          url = page.url,
+          created_time = page.created_time,
+          last_edited_time = page.last_edited_time
+        })
+      end
+    end
+
+    -- Progress notification for large databases
+    if request_count > 0 and request_count % 5 == 0 then
+      vim.notify(string.format('Fetching pages... (%d requests)', request_count), vim.log.levels.INFO)
+    end
+
+    if result and result.has_more and result.next_cursor then
+      next_cursor = result.next_cursor
+      request_count = request_count + 1
+      if request_count >= max_requests then
+        vim.notify('Pagination limit reached. Some pages may not be shown.', vim.log.levels.WARN)
+        break
+      end
+    else
+      next_cursor = nil
+    end
+
+  until not next_cursor
+
+  return all_pages
+end
+
 function M.create_page(title)
   local database_id = config.get('database_id')
   if not database_id then
@@ -1069,38 +1129,45 @@ function M.list_and_edit_pages()
     return
   end
 
-  local data = {
-    page_size = config.get('page_size') or 10
-  }
+  -- Fetch all pages with pagination
+  local pages = M.get_all_pages(database_id)
 
-  local result = make_request('POST', '/databases/' .. database_id .. '/query', data)
-  if result and result.results then
-    local pages = {}
-    for _, page in ipairs(result.results) do
-      local title = 'Untitled'
-      if page.properties.Name and page.properties.Name.title and #page.properties.Name.title > 0 then
-        title = page.properties.Name.title[1].text.content
-      end
-      table.insert(pages, {
-        id = page.id,
-        title = title,
-        url = page.url,
-        created_time = page.created_time,
-        last_edited_time = page.last_edited_time
-      })
-    end
-
-    vim.ui.select(pages, {
-      prompt = 'Select a Notion page to edit:',
-      format_item = function(item)
-        return item.title
-      end,
-    }, function(choice)
-      if choice then
-        M.edit_page(choice.id)
-      end
-    end)
+  if not pages or #pages == 0 then
+    vim.notify('No pages found in database', vim.log.levels.WARN)
+    return
   end
+
+  vim.notify(string.format('Found %d pages', #pages), vim.log.levels.INFO)
+
+  -- Callback when page is selected
+  local function on_page_selected(page)
+    M.edit_page(page.id)
+  end
+
+  -- Try Telescope if configured/available
+  if config.should_use_telescope() then
+    local ok, telescope_picker = pcall(require, 'notion.telescope')
+    if ok then
+      telescope_picker.notion_pages(pages, on_page_selected)
+      return
+    else
+      if config.get('use_telescope') == true then
+        vim.notify('Telescope not available, falling back to vim.ui.select', vim.log.levels.WARN)
+      end
+    end
+  end
+
+  -- Fallback to vim.ui.select
+  vim.ui.select(pages, {
+    prompt = 'Select a Notion page to edit:',
+    format_item = function(item)
+      return item.title
+    end,
+  }, function(choice)
+    if choice then
+      on_page_selected(choice)
+    end
+  end)
 end
 
 M.calculate_diff_operations = calculate_diff_operations

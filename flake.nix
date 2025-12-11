@@ -2,8 +2,8 @@
   description = "Development environment for notion.nvim";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
   outputs = inputs @ {flake-parts, ...}:
@@ -19,7 +19,7 @@
         ...
       }: {
         packages.notion-nvim = pkgs.vimUtils.buildVimPlugin {
-          dependencies = with pkgs.vimPlugins; [plenary-nvim];
+          dependencies = with pkgs.vimPlugins; [telescope-nvim penary-nvim];
           name = "notion-nvim";
           version = "unstable";
           src = ./.;
