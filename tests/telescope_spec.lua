@@ -1,3 +1,4 @@
+-- luacheck: globals reset_vim_mocks
 require('tests.spec_helper')
 
 describe("Telescope integration", function()
@@ -257,7 +258,13 @@ describe("Telescope integration", function()
         return {
           status = 200,
           body = vim.json.encode({
-            results = { { id = "page" .. request_count, properties = { Name = { title = { { text = { content = "Page " .. request_count } } } } }, url = "", created_time = "", last_edited_time = "" } },
+            results = { {
+              id = "page" .. request_count,
+              properties = { Name = { title = { { text = { content = "Page " .. request_count } } } } },
+              url = "",
+              created_time = "",
+              last_edited_time = ""
+            } },
             has_more = true,
             next_cursor = "cursor" .. request_count
           })
@@ -283,8 +290,20 @@ describe("Telescope integration", function()
           status = 200,
           body = vim.json.encode({
             results = {
-              { id = "page1", properties = { Name = { title = { { text = { content = "Page 1" } } } } }, url = "https://notion.so/page1", created_time = "2024-01-01", last_edited_time = "2024-01-02" },
-              { id = "page2", properties = { Name = { title = { { text = { content = "Page 2" } } } } }, url = "https://notion.so/page2", created_time = "2024-01-03", last_edited_time = "2024-01-04" }
+              {
+                id = "page1",
+                properties = { Name = { title = { { text = { content = "Page 1" } } } } },
+                url = "https://notion.so/page1",
+                created_time = "2024-01-01",
+                last_edited_time = "2024-01-02"
+              },
+              {
+                id = "page2",
+                properties = { Name = { title = { { text = { content = "Page 2" } } } } },
+                url = "https://notion.so/page2",
+                created_time = "2024-01-03",
+                last_edited_time = "2024-01-04"
+              }
             },
             has_more = false
           })
