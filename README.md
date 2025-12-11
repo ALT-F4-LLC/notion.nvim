@@ -278,30 +278,30 @@ We welcome contributions to notion.nvim! Whether you're fixing bugs, adding feat
 ### Development Setup
 
 1. **Clone the repository**
-   ```bash
-   git clone https://github.com/ALT-F4-LLC/notion.nvim.git
-   cd notion.nvim
-   ```
+```bash
+git clone https://github.com/ALT-F4-LLC/notion.nvim.git
+cd notion.nvim
+```
 
 2. **Install dependencies**
 
-   **Option 1: Using Nix (Recommended)**
-   ```bash
-   nix develop  # Provides lua, busted, luacheck, luacov, and all dependencies
-   ```
+**Option 1: Using Nix (Recommended)**
+```bash
+nix develop  # Provides lua, busted, luacheck, luacov, and all dependencies
+```
 
-   **Option 2: Manual installation**
-   - Install Lua 5.4+ or LuaJIT
-   - Install [busted](https://github.com/lunarmodules/busted) for testing
-   - Install [luacheck](https://github.com/mpeterv/luacheck) for linting
-   - Install [plenary.nvim](https://github.com/nvim-lua/plenary.nvim)
+**Option 2: Manual installation**
+- Install Lua 5.4+ or LuaJIT
+- Install [busted](https://github.com/lunarmodules/busted) for testing
+- Install [luacheck](https://github.com/mpeterv/luacheck) for linting
+- Install [plenary.nvim](https://github.com/nvim-lua/plenary.nvim)
 
 3. **Set up test environment**
-   ```bash
-   # Set up Notion API credentials for testing (optional)
-   export NOTION_TOKEN="your_test_integration_token"
-   export NOTION_DATABASE_ID="your_test_database_id"
-   ```
+```bash
+# Set up Notion API credentials for testing (optional)
+export NOTION_TOKEN="your_test_integration_token"
+export NOTION_DATABASE_ID="your_test_database_id"
+```
 
 ### Running Tests
 
@@ -332,32 +332,35 @@ luacheck lua/ tests/ --globals vim
 ### Making Changes
 
 1. **Create a branch** for your feature or bugfix
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
+```bash
+git checkout -b feature/your-feature-name
+```
 
 2. **Write tests** for your changes
-   - Add tests in `tests/` directory
-   - Follow existing test patterns in `*_spec.lua` files
-   - Ensure all tests pass with `make test`
+
+- Add tests in `tests/` directory
+- Follow existing test patterns in `*_spec.lua` files
+- Ensure all tests pass with `make test`
 
 3. **Follow code style**
-   - Use 2-space indentation
-   - Run `make lint` to check for issues
-   - Write clear, descriptive commit messages
+
+- Use 2-space indentation
+- Run `make lint` to check for issues
+- Write clear, descriptive commit messages
 
 4. **Update documentation**
-   - Update README.md if adding user-facing features
-   - Add inline comments for complex logic
+
+- Update README.md if adding user-facing features
+- Add inline comments for complex logic
 
 ### Submitting Pull Requests
 
 1. **Ensure all tests pass** (`make test`)
 2. **Ensure linting passes** (`make lint`)
 3. **Create a pull request** with:
-   - Clear description of changes
-   - Link to related issues (if any)
-   - Screenshots/examples for UI changes
+- Clear description of changes
+- Link to related issues (if any)
+- Screenshots/examples for UI changes
 
 ### Development Resources
 
