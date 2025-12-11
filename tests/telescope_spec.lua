@@ -415,5 +415,61 @@ describe("Telescope integration", function()
       assert.is_true(#errors > 0)
       assert.is_not_nil(errors[1]:match("Database ID not configured"))
     end)
+
+    it("sorts pages alphabetically by title (case-insensitive)", function()
+      -- Mock unsorted pages from API
+      mock_curl.post = function()
+        return {
+          status = 200,
+          body = vim.json.encode({
+            results = {
+              {
+                id = "page3",
+                properties = { Name = { title = { { text = { content = "Zebra Project" } } } } },
+                url = "https://notion.so/page3",
+                created_time = "2024-01-03",
+                last_edited_time = "2024-01-03"
+              },
+              {
+                id = "page1",
+                properties = { Name = { title = { { text = { content = "Apple Notes" } } } } },
+                url = "https://notion.so/page1",
+                created_time = "2024-01-01",
+                last_edited_time = "2024-01-01"
+              },
+              {
+                id = "page4",
+                properties = { Name = { title = { { text = { content = "banana ideas" } } } } },
+                url = "https://notion.so/page4",
+                created_time = "2024-01-04",
+                last_edited_time = "2024-01-04"
+              },
+              {
+                id = "page2",
+                properties = { Name = { title = { { text = { content = "Untitled" } } } } },
+                url = "https://notion.so/page2",
+                created_time = "2024-01-02",
+                last_edited_time = "2024-01-02"
+              }
+            },
+            has_more = false
+          })
+        }
+      end
+
+      local selected_pages = {}
+      vim.ui.select = function(items, opts, on_choice)
+        selected_pages = items
+      end
+
+      api.list_and_edit_pages()
+
+      -- Verify pages are sorted alphabetically (case-insensitive)
+      assert.are.equal(4, #selected_pages)
+      assert.are.equal("Apple Notes", selected_pages[1].title)
+      assert.are.equal("banana ideas", selected_pages[2].title)
+      assert.are.equal("Untitled", selected_pages[3].title)
+      assert.are.equal("Zebra Project", selected_pages[4].title)
+    end)
   end)
 end)
