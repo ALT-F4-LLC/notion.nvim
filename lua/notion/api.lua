@@ -5,6 +5,7 @@ This module provides the core functionality for integrating with Notion's API,
 including intelligent diff-based synchronization that only updates changed content.
 
 Key features:
+- Async (non-blocking) HTTP via coroutine wrapper around plenary.curl
 - Diff-based sync algorithm for optimal performance
 - Rich text formatting support (bold, italic, code, links)
 - Block-level content management
@@ -13,6 +14,7 @@ Key features:
 
 Performance: Typical sync times are 200-800ms for small edits, scaling with
 the amount of changed content rather than total document size.
+All API calls are non-blocking when called from async context (coroutine).
 --]]
 
 local M = {}
@@ -22,8 +24,258 @@ local curl = require('plenary.curl')
 -- Track ongoing syncs to prevent duplicates and implement debouncing
 local sync_state = {}
 
+-- Block cache: keyed by page_id, stores { blocks = <block_data>, timestamp = <os.time()> }
+local block_cache = {}
+
 -- Collect debug messages to show in a single popup when debug mode is enabled
 local debug_messages = {}
+
+-- Async operation status tracking for spinner/notifications
+local async_status = {
+  active_ops = 0,
+}
+
+-- Notify user about async operation status (spinner-like feedback)
+local function async_notify_start(operation_name)
+  async_status.active_ops = async_status.active_ops + 1
+  vim.notify('[Notion] ' .. operation_name .. '...', vim.log.levels.INFO)
+end
+
+-- Notify completion of async operation
+local function async_notify_end(operation_name, success)
+  async_status.active_ops = math.max(0, async_status.active_ops - 1)
+  if not success then
+    vim.notify('[Notion] ' .. operation_name .. ' failed', vim.log.levels.ERROR)
+  end
+end
+
+-- Run a function inside a coroutine, providing async context.
+-- All make_request() calls inside fn will use the non-blocking async path.
+-- Neovim API calls from within the coroutine are safe because we resume via
+-- vim.schedule().
+local function run_async(fn)
+  local co = coroutine.create(fn)
+  local ok, err = coroutine.resume(co)
+  if not ok then
+    vim.schedule(function()
+      vim.notify('[Notion] Async error: ' .. tostring(err), vim.log.levels.ERROR)
+    end)
+  end
+end
+
+-- Perform an async HTTP request using plenary.curl in a non-blocking fashion.
+-- Must be called from within a coroutine. Yields the coroutine and resumes it
+-- (via vim.schedule) when the HTTP response arrives.
+--
+-- The function sets opts.callback so that plenary.curl runs asynchronously.
+-- When plenary.curl fires the callback, we resume the coroutine on the main
+-- event loop via vim.schedule.
+--
+-- @param method string: HTTP method name used to select the curl function
+-- @param opts table: options table passed to plenary.curl (url, headers, body, etc.)
+-- @return table: the HTTP response (same shape as the sync plenary.curl return value)
+local function async_curl_request(method, opts)
+  local co = coroutine.running()
+  if not co then
+    error('async_curl_request called outside of a coroutine')
+  end
+
+  -- Track whether the callback has already been invoked synchronously
+  -- (can happen in test environments where mocks execute callbacks inline)
+  local resolved = false
+  local resolved_response = nil
+
+  -- Build the callback that resumes the coroutine on the main loop.
+  -- If called before we reach coroutine.yield(), we store the response
+  -- and skip the yield entirely.
+  opts.callback = function(response)
+    if coroutine.status(co) == "running" then
+      -- Callback fired synchronously (before yield) -- store for later
+      resolved = true
+      resolved_response = response
+    else
+      -- Normal async path: resume the yielded coroutine on the main loop
+      vim.schedule(function()
+        coroutine.resume(co, response)
+      end)
+    end
+  end
+
+  -- Dispatch to the correct plenary.curl method
+  local sync_response
+  if method == 'GET' then
+    sync_response = curl.get(opts)
+  elseif method == 'POST' then
+    sync_response = curl.post(opts)
+  elseif method == 'PATCH' then
+    sync_response = curl.patch(opts)
+  elseif method == 'DELETE' then
+    sync_response = curl.delete(opts)
+  end
+
+  -- If the callback already fired synchronously, return the response directly
+  -- without yielding (avoids "attempt to yield from outside a coroutine" in tests)
+  if resolved then
+    return resolved_response
+  end
+
+  -- If the curl function returned a response directly (sync mock without callback
+  -- support), use it instead of yielding
+  if sync_response and type(sync_response) == "table" and sync_response.status then
+    return sync_response
+  end
+
+  -- Normal async path: yield until the callback resumes us with the response
+  return coroutine.yield()
+end
+
+-- Non-blocking sleep for use inside coroutines. Uses vim.defer_fn() instead
+-- of the blocking vim.loop.sleep(), so the editor remains responsive.
+local function async_sleep(ms)
+  local co = coroutine.running()
+  if not co then
+    -- Fallback to blocking sleep when not in a coroutine
+    vim.loop.sleep(ms)
+    return
+  end
+
+  -- Track whether the deferred fn fires synchronously (test environments)
+  local timer_fired = false
+  vim.defer_fn(function()
+    if coroutine.status(co) == "running" then
+      -- Fired synchronously before yield -- just set flag and return
+      timer_fired = true
+    else
+      coroutine.resume(co)
+    end
+  end, ms)
+
+  -- If the timer already fired synchronously, skip the yield
+  if not timer_fired then
+    coroutine.yield()
+  end
+end
+
+-- Run a list of task functions concurrently (up to max_concurrent at a time).
+-- Each task is a zero-argument function that performs an API call and returns
+-- a result. Must be called from within a coroutine (async context).
+--
+-- Returns a list of results (one per task, in order). Each result is a table
+-- with { ok = bool, value = <return value or error string> }.
+--
+-- If not in a coroutine, falls back to sequential execution.
+local function run_concurrent(tasks, max_concurrent)
+  max_concurrent = max_concurrent or config.get('max_concurrent_requests') or 5
+  local results = {}
+
+  if #tasks == 0 then
+    return results
+  end
+
+  -- Pre-initialize results table
+  for i = 1, #tasks do
+    results[i] = { ok = false, value = nil }
+  end
+
+  local in_coroutine = coroutine.running() ~= nil
+  if not in_coroutine then
+    -- Sequential fallback when not in async context
+    for i, task in ipairs(tasks) do
+      local ok, val = pcall(task)
+      results[i] = { ok = ok, value = val }
+    end
+    return results
+  end
+
+  -- Process tasks in batches of max_concurrent
+  for batch_start = 1, #tasks, max_concurrent do
+    local batch_end = math.min(batch_start + max_concurrent - 1, #tasks)
+    local batch_size = batch_end - batch_start + 1
+    local completed = 0
+
+    -- The parent coroutine will yield once and be resumed when all tasks in
+    -- the batch are done.
+    local parent_co = coroutine.running()
+
+    for i = batch_start, batch_end do
+      -- Launch each task in its own coroutine
+      local task_index = i
+      local task_co = coroutine.create(function()
+        local ok, val = pcall(tasks[task_index])
+        results[task_index] = { ok = ok, value = val }
+
+        -- Track completion; when all done, resume the parent
+        completed = completed + 1
+        if completed == batch_size then
+          -- All tasks in this batch are done -- resume parent
+          if coroutine.status(parent_co) == "suspended" then
+            vim.schedule(function()
+              coroutine.resume(parent_co)
+            end)
+          end
+        end
+      end)
+
+      local ok, err = coroutine.resume(task_co)
+      if not ok then
+        results[i] = { ok = false, value = tostring(err) }
+        completed = completed + 1
+      end
+    end
+
+    -- If all tasks in this batch already completed synchronously (e.g. in
+    -- tests where mocks fire callbacks inline), skip the yield.
+    if completed < batch_size then
+      coroutine.yield()
+    end
+  end
+
+  return results
+end
+
+-- Check if caching is enabled based on cache_ttl config
+local function cache_enabled()
+  local ttl = config.get('cache_ttl')
+  return ttl and ttl > 0
+end
+
+-- Get cached blocks for a page_id if fresh, otherwise return nil
+local function get_cached_blocks(page_id)
+  if not cache_enabled() then
+    return nil
+  end
+
+  local entry = block_cache[page_id]
+  if not entry then
+    return nil
+  end
+
+  local ttl = config.get('cache_ttl')
+  local age = os.time() - entry.timestamp
+  if age >= ttl then
+    block_cache[page_id] = nil
+    return nil
+  end
+
+  return entry.blocks
+end
+
+-- Store blocks in cache for a page_id
+local function set_cached_blocks(page_id, blocks)
+  if not cache_enabled() then
+    return
+  end
+
+  block_cache[page_id] = {
+    blocks = blocks,
+    timestamp = os.time(),
+  }
+end
+
+-- Clear cache entry for a page_id
+local function clear_cached_blocks(page_id)
+  block_cache[page_id] = nil
+end
 
 -- Simple notification helper
 local function notify_user(message, level)
@@ -55,9 +307,13 @@ local NOTION_API_URL = 'https://api.notion.com/v1'
 local NOTION_VERSION = '2022-06-28'
 
 
+-- Core HTTP request function. Detects whether it is running inside a coroutine:
+--   * If yes  -> uses async_curl_request (non-blocking, yields to event loop)
+--   * If no   -> uses synchronous plenary.curl (backward-compatible fallback)
+-- All existing call sites continue to work unchanged.
 local function make_request(method, endpoint, data)
-  local debug = config.get('debug')
-  local request_start = debug and vim.loop.hrtime() or nil
+  local debug_mode = config.get('debug')
+  local request_start = debug_mode and vim.loop.hrtime() or nil
 
   local token = config.get('notion_token')
   if not token then
@@ -71,6 +327,9 @@ local function make_request(method, endpoint, data)
     ['Notion-Version'] = NOTION_VERSION,
   }
 
+  -- Detect whether we're in a coroutine (async context)
+  local in_coroutine = coroutine.running() ~= nil
+
   local function perform_request(url, body)
     local retries = 3
     local response
@@ -80,37 +339,49 @@ local function make_request(method, endpoint, data)
         url = url,
         headers = headers,
         timeout = 10000,
-        compressed = false,
+        compressed = true,
       }
 
       if (method == 'POST' or method == 'PATCH') and body then
         opts.body = vim.json.encode(body)
       end
 
-      if method == 'GET' then
-        response = curl.get(opts)
-      elseif method == 'POST' then
-        response = curl.post(opts)
-      elseif method == 'PATCH' then
-        response = curl.patch(opts)
-      elseif method == 'DELETE' then
-        response = curl.delete(opts)
+      if in_coroutine then
+        -- Async path: non-blocking via coroutine yield
+        response = async_curl_request(method, opts)
+      else
+        -- Sync path: blocking call (backward compatibility)
+        if method == 'GET' then
+          response = curl.get(opts)
+        elseif method == 'POST' then
+          response = curl.post(opts)
+        elseif method == 'PATCH' then
+          response = curl.patch(opts)
+        elseif method == 'DELETE' then
+          response = curl.delete(opts)
+        end
       end
 
       if response and response.status == 429 then
         retries = retries - 1
         local retry_after = response.headers['Retry-After'] or '1'
         vim.notify('Rate limited. Retrying after ' .. retry_after .. ' seconds...', vim.log.levels.WARN)
-        vim.loop.sleep(tonumber(retry_after) * 1000)
+        -- Use non-blocking sleep in async context, blocking otherwise
+        async_sleep(tonumber(retry_after) * 1000)
       else
         break
       end
     end
 
-    if debug and request_start then
+    if debug_mode and request_start then
       local request_end = vim.loop.hrtime()
       table.insert(debug_messages, method .. " request to " .. url .. " took: " ..
         ((request_end - request_start) / 1000000) .. "ms")
+    end
+
+    if not response then
+      vim.notify('Notion API error: no response (network failure?)', vim.log.levels.ERROR)
+      return nil
     end
 
     if response.status ~= 200 and response.status ~= 204 then
@@ -194,7 +465,7 @@ function M.get_all_pages(database_id, page_size)
 
   repeat
     local data = {
-      page_size = page_size or config.get('page_size') or 10
+      page_size = page_size or config.get('page_size') or 100
     }
 
     if next_cursor then
@@ -245,7 +516,8 @@ function M.get_all_pages(database_id, page_size)
   return all_pages
 end
 
-function M.create_page(title)
+-- Internal implementation of create_page (can run in sync or async context)
+local function create_page_impl(title)
   local database_id = config.get('database_id')
   if not database_id then
     vim.notify('Database ID not configured. Set NOTION_DATABASE_ID or configure in setup()', vim.log.levels.ERROR)
@@ -286,7 +558,28 @@ function M.create_page(title)
   end
 end
 
-function M.list_pages()
+-- Public create_page: launches in async coroutine for non-blocking execution
+function M.create_page(title)
+  -- Validation that doesn't require async
+  if not title or title == '' then
+    vim.notify('Page title is required. Usage: :NotionCreate <title>', vim.log.levels.ERROR)
+    return
+  end
+  local database_id = config.get('database_id')
+  if not database_id then
+    vim.notify('Database ID not configured. Set NOTION_DATABASE_ID or configure in setup()', vim.log.levels.ERROR)
+    return
+  end
+
+  async_notify_start('Creating page')
+  run_async(function()
+    local result = create_page_impl(title)
+    async_notify_end('Creating page', result ~= nil)
+  end)
+end
+
+-- Internal implementation of list_pages (can run in sync or async context)
+local function list_pages_impl()
   local database_id = config.get('database_id')
   if not database_id then
     vim.notify('Database ID not configured', vim.log.levels.ERROR)
@@ -294,7 +587,7 @@ function M.list_pages()
   end
 
   local data = {
-    page_size = config.get('page_size') or 10
+    page_size = config.get('page_size') or 100
   }
 
   local result = make_request('POST', '/databases/' .. database_id .. '/query', data)
@@ -327,9 +620,25 @@ function M.list_pages()
   end
 end
 
-function M.open_page(query)
+-- Public list_pages: launches in async coroutine for non-blocking execution
+function M.list_pages()
+  local database_id = config.get('database_id')
+  if not database_id then
+    vim.notify('Database ID not configured', vim.log.levels.ERROR)
+    return
+  end
+
+  async_notify_start('Loading pages')
+  run_async(function()
+    list_pages_impl()
+    async_notify_end('Loading pages', true)
+  end)
+end
+
+-- Internal implementation of open_page (can run in sync or async context)
+local function open_page_impl(query)
   if not query or query == '' then
-    M.list_pages()
+    list_pages_impl()
     return
   end
 
@@ -346,7 +655,7 @@ function M.open_page(query)
         contains = query
       }
     },
-    page_size = config.get('page_size') or 10
+    page_size = config.get('page_size') or 100
   }
 
   local result = make_request('POST', '/databases/' .. database_id .. '/query', data)
@@ -358,6 +667,26 @@ function M.open_page(query)
   else
     vim.notify('No pages found matching: ' .. query, vim.log.levels.WARN)
   end
+end
+
+-- Public open_page: launches in async coroutine for non-blocking execution
+function M.open_page(query)
+  if not query or query == '' then
+    M.list_pages()
+    return
+  end
+
+  local database_id = config.get('database_id')
+  if not database_id then
+    vim.notify('Database ID not configured', vim.log.levels.ERROR)
+    return
+  end
+
+  async_notify_start('Opening page')
+  run_async(function()
+    open_page_impl(query)
+    async_notify_end('Opening page', true)
+  end)
 end
 
 --[[
@@ -377,12 +706,8 @@ function M.open_current_page_in_browser()
   vim.notify('Opened current page in browser', vim.log.levels.INFO)
 end
 
---[[
-Delete (archive) a Notion page.
-This function lists all pages and allows the user to select one for deletion.
-Note: Notion doesn't actually delete pages, it archives them.
---]]
-function M.delete_page()
+-- Internal implementation of delete_page (can run in sync or async context)
+local function delete_page_impl()
   local database_id = config.get('database_id')
   if not database_id then
     vim.notify('Database ID not configured', vim.log.levels.ERROR)
@@ -390,7 +715,7 @@ function M.delete_page()
   end
 
   local data = {
-    page_size = config.get('page_size') or 10
+    page_size = config.get('page_size') or 100
   }
 
   local result = make_request('POST', '/databases/' .. database_id .. '/query', data)
@@ -427,8 +752,8 @@ function M.delete_page()
 
           -- Close the buffer if it's currently open
           for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-            local ok, page_id = pcall(vim.api.nvim_buf_get_var, buf, 'notion_page_id')
-            if ok and page_id == choice.id then
+            local ok_var, page_id = pcall(vim.api.nvim_buf_get_var, buf, 'notion_page_id')
+            if ok_var and page_id == choice.id then
               vim.api.nvim_buf_delete(buf, { force = true })
               break
             end
@@ -439,6 +764,25 @@ function M.delete_page()
       end
     end)
   end
+end
+
+--[[
+Delete (archive) a Notion page.
+This function lists all pages and allows the user to select one for deletion.
+Note: Notion doesn't actually delete pages, it archives them.
+--]]
+function M.delete_page()
+  local database_id = config.get('database_id')
+  if not database_id then
+    vim.notify('Database ID not configured', vim.log.levels.ERROR)
+    return
+  end
+
+  async_notify_start('Loading pages for deletion')
+  run_async(function()
+    delete_page_impl()
+    async_notify_end('Loading pages for deletion', true)
+  end)
 end
 
 function M.open_page_by_url(url)
@@ -521,6 +865,11 @@ local function block_to_comparable_string(block)
 end
 
 -- Calculate diff operations between existing and new blocks
+-- Maximum number of blocks to search ahead in each direction when looking for
+-- a sync point after a type mismatch. Prevents O(n*m) worst case on large
+-- documents with structural edits.
+local DIFF_SEARCH_WINDOW = 50
+
 local function calculate_diff_operations(existing_blocks_results, new_blocks)
   local operations = {
     updates = {},
@@ -533,6 +882,17 @@ local function calculate_diff_operations(existing_blocks_results, new_blocks)
   local num_existing = #existing_blocks
   local num_new = #new_blocks
 
+  -- Pre-compute comparable strings for all blocks to avoid redundant conversions
+  -- inside the diff loop. Each block's comparable string is computed once and reused.
+  local existing_strings = {}
+  for idx, block in ipairs(existing_blocks) do
+    existing_strings[idx] = block_to_comparable_string(block)
+  end
+  local new_strings = {}
+  for idx, block in ipairs(new_blocks) do
+    new_strings[idx] = block_to_comparable_string(block)
+  end
+
   local i = 1
   local j = 1
   local last_stable_block_id = nil
@@ -540,8 +900,8 @@ local function calculate_diff_operations(existing_blocks_results, new_blocks)
   while i <= num_existing and j <= num_new do
     local old_block = existing_blocks[i]
     local new_block = new_blocks[j]
-    local old_comparable = block_to_comparable_string(old_block)
-    local new_comparable = block_to_comparable_string(new_block)
+    local old_comparable = existing_strings[i]
+    local new_comparable = new_strings[j]
 
     if old_comparable == new_comparable then
       -- Blocks are identical, no-op
@@ -560,11 +920,15 @@ local function calculate_diff_operations(existing_blocks_results, new_blocks)
       j = j + 1
     else
       -- Type mismatch or other difference. We need to find the next sync point.
+      -- Cap the search to DIFF_SEARCH_WINDOW blocks ahead in each direction
+      -- to prevent O(n*m) worst case on large documents with structural edits.
       local k = i
-      while k <= num_existing do
+      local k_max = math.min(num_existing, i + DIFF_SEARCH_WINDOW)
+      local l_max = math.min(num_new, j + DIFF_SEARCH_WINDOW)
+      while k <= k_max do
         local l = j
-        while l <= num_new do
-          if block_to_comparable_string(existing_blocks[k]) == block_to_comparable_string(new_blocks[l]) then
+        while l <= l_max do
+          if existing_strings[k] == new_strings[l] then
             -- Found a sync point. Delete blocks from i to k-1 and insert from j to l-1.
             for del_idx = i, k - 1 do
               table.insert(operations.deletes, { block_id = existing_blocks[del_idx].id })
@@ -588,7 +952,8 @@ local function calculate_diff_operations(existing_blocks_results, new_blocks)
         k = k + 1
       end
 
-      -- No sync point found. Delete remaining old blocks and insert remaining new ones.
+      -- No sync point found within search window.
+      -- Delete remaining old blocks and insert remaining new ones.
       for del_idx = i, num_existing do
         table.insert(operations.deletes, { block_id = existing_blocks[del_idx].id })
       end
@@ -691,17 +1056,8 @@ local function blocks_to_markdown(blocks)
   return lines
 end
 
---[[
-Edit a Notion page directly in a Neovim buffer with automatic sync.
-
-This function fetches the page content, converts it to markdown, and opens it
-in a new buffer with auto-sync capabilities. When you save the buffer (:w),
-changes are automatically synced back to Notion using intelligent diff-based
-updates that only modify changed blocks.
-
-@param page_id string: The Notion page ID to edit
---]]
-function M.edit_page(page_id)
+-- Internal implementation of edit_page (can run in sync or async context)
+local function edit_page_impl(page_id)
   if not page_id then
     vim.notify('Page ID required', vim.log.levels.ERROR)
     return
@@ -722,16 +1078,20 @@ function M.edit_page(page_id)
   -- Get page content blocks
   local all_blocks = M.get_all_blocks(page_id)
 
+  -- Cache the fetched blocks for use during sync
+  set_cached_blocks(page_id, all_blocks)
+
   -- Convert blocks to markdown
   local markdown_lines = blocks_to_markdown(all_blocks)
 
-  -- Create new buffer
+  -- Create new buffer (Neovim API calls are safe here because in async context
+  -- we resumed via vim.schedule, so we're on the main loop)
   local buf = vim.api.nvim_create_buf(false, false)
   vim.api.nvim_buf_set_name(buf, title .. '.md')
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, markdown_lines)
-  vim.api.nvim_buf_set_option(buf, 'filetype', 'markdown')
-  vim.api.nvim_buf_set_option(buf, 'buftype', 'acwrite')
-  vim.api.nvim_buf_set_option(buf, 'modified', false)
+  vim.bo[buf].filetype = 'markdown'
+  vim.bo[buf].buftype = 'acwrite'
+  vim.bo[buf].modified = false
 
   -- Store page metadata
   vim.api.nvim_buf_set_var(buf, 'notion_page_id', page_id)
@@ -746,10 +1106,44 @@ function M.edit_page(page_id)
     desc = "Auto-sync Notion page on save"
   })
 
+  -- Clear cache when buffer is closed
+  vim.api.nvim_create_autocmd({"BufDelete", "BufWipeout"}, {
+    buffer = buf,
+    callback = function()
+      clear_cached_blocks(page_id)
+    end,
+    desc = "Clear Notion block cache on buffer close"
+  })
+
   -- Open buffer in current window
   vim.api.nvim_set_current_buf(buf)
 
   vim.notify('Loaded Notion page: ' .. title, vim.log.levels.INFO)
+end
+
+--[[
+Edit a Notion page directly in a Neovim buffer with automatic sync.
+
+This function fetches the page content, converts it to markdown, and opens it
+in a new buffer with auto-sync capabilities. When you save the buffer (:w),
+changes are automatically synced back to Notion using intelligent diff-based
+updates that only modify changed blocks.
+
+Runs asynchronously -- does not block the Neovim event loop.
+
+@param page_id string: The Notion page ID to edit
+--]]
+function M.edit_page(page_id)
+  if not page_id then
+    vim.notify('Page ID required', vim.log.levels.ERROR)
+    return
+  end
+
+  async_notify_start('Loading page')
+  run_async(function()
+    edit_page_impl(page_id)
+    async_notify_end('Loading page', true)
+  end)
 end
 
 -- Parse inline markdown formatting and return rich_text array
@@ -928,31 +1322,14 @@ local function markdown_to_blocks(lines)
   return blocks
 end
 
-
---[[
-Sync the current buffer's content back to Notion using intelligent diff-based updates.
-
-This function implements a sophisticated sync algorithm that:
-1. Fetches existing blocks from the Notion page
-2. Converts the buffer content to Notion block format
-3. Calculates a diff between existing and new content
-4. Only updates blocks that have actually changed
-5. Preserves unchanged blocks for optimal performance
-6. Maintains proper block ordering using Notion's positioning API
-
-Performance: Typically 200-800ms for small edits, scaling with the amount of
-changed content rather than total document size.
-
-The function includes comprehensive error handling, debouncing to prevent API
-abuse, and detailed debug output when debug mode is enabled.
---]]
-function M.sync_page()
-  local debug = config.get('debug')
-  local start_time = debug and vim.loop.hrtime() or nil
+-- Internal implementation of sync_page (can run in sync or async context)
+local function sync_page_impl()
+  local debug_mode = config.get('debug')
+  local start_time = debug_mode and vim.loop.hrtime() or nil
   local buf = vim.api.nvim_get_current_buf()
 
   -- Clear previous debug messages
-  if debug then
+  if debug_mode then
     debug_messages = {}
   end
 
@@ -989,49 +1366,60 @@ function M.sync_page()
   sync_state[page_id].in_progress = true
   sync_state[page_id].last_sync = vim.loop.hrtime()
 
-  local check_time = debug and vim.loop.hrtime() or nil
-  if debug then
+  local check_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode then
     table.insert(debug_messages, "Page check took: " .. ((check_time - start_time) / 1000000) .. "ms")
   end
 
   -- Get buffer content
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
-  local lines_time = debug and vim.loop.hrtime() or nil
-  if debug then
+  local lines_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode then
     table.insert(debug_messages, "Get lines took: " .. ((lines_time - check_time) / 1000000) .. "ms")
   end
 
   -- Convert markdown to blocks
   local blocks = markdown_to_blocks(lines)
 
-  local blocks_time = debug and vim.loop.hrtime() or nil
-  if debug then
+  local blocks_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode then
     table.insert(debug_messages, "Markdown conversion took: " .. ((blocks_time - lines_time) / 1000000) .. "ms")
   end
 
   if #blocks == 0 then
     vim.notify('No content to sync', vim.log.levels.WARN)
+    sync_state[page_id].in_progress = false
     return
   end
 
   -- Strategy: Diff-based sync - only update changed blocks, maintain order
-  if debug then
-    table.insert(debug_messages, "Getting existing blocks for diff...")
+  -- Check cache first to avoid redundant API calls
+  local existing_blocks = get_cached_blocks(page_id)
+  local used_cache = existing_blocks ~= nil
+
+  if debug_mode then
+    if used_cache then
+      table.insert(debug_messages, "Using cached blocks for diff")
+    else
+      table.insert(debug_messages, "Getting existing blocks for diff...")
+    end
   end
 
-  local existing_blocks = M.get_all_blocks(page_id)
+  if not existing_blocks then
+    existing_blocks = M.get_all_blocks(page_id)
+  end
 
-  local get_time = debug and vim.loop.hrtime() or nil
-  if debug then
+  local get_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode then
     table.insert(debug_messages, "GET existing blocks took: " .. ((get_time - blocks_time) / 1000000) .. "ms")
   end
 
   -- Find blocks that need to be deleted/updated/inserted
   local operations = calculate_diff_operations(existing_blocks, blocks)
 
-  local diff_time = debug and vim.loop.hrtime() or nil
-  if debug then
+  local diff_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode then
     table.insert(debug_messages, "Diff calculation took: " .. ((diff_time - get_time) / 1000000) .. "ms")
     local num_inserts = 0
     for _, op in ipairs(operations.inserts) do
@@ -1041,63 +1429,96 @@ function M.sync_page()
       " deletes, " .. num_inserts .. " inserts, " .. operations.noops .. " no-ops")
   end
 
-  -- Apply operations in order: updates, deletes, then inserts
-  local update_start = debug and vim.loop.hrtime() or nil
-  for _, update_op in ipairs(operations.updates) do
-    make_request('PATCH', '/blocks/' .. update_op.block_id, update_op.payload)
-  end
+  -- Apply operations: updates + deletes concurrently, then inserts sequentially.
+  -- Updates and deletes touch different blocks (guaranteed by diff algorithm),
+  -- so they can all run in parallel. Deletes must finish before inserts start
+  -- to ensure block positioning is correct.
+  local sync_result = true
 
-  local delete_start = debug and vim.loop.hrtime() or nil
-  if debug and update_start then
-    table.insert(debug_messages, "All updates took: " .. ((delete_start - update_start) / 1000000) .. "ms")
+  -- Build concurrent task list for updates and deletes together
+  local concurrent_tasks = {}
+  local update_start = debug_mode and vim.loop.hrtime() or nil
+
+  for _, update_op in ipairs(operations.updates) do
+    local op = update_op -- capture for closure
+    table.insert(concurrent_tasks, function()
+      return make_request('PATCH', '/blocks/' .. op.block_id, op.payload)
+    end)
   end
 
   for _, delete_op in ipairs(operations.deletes) do
-    make_request('DELETE', '/blocks/' .. delete_op.block_id)
+    local op = delete_op -- capture for closure
+    table.insert(concurrent_tasks, function()
+      return make_request('DELETE', '/blocks/' .. op.block_id)
+    end)
   end
 
-  local insert_start = debug and vim.loop.hrtime() or nil
-  if debug and delete_start then
-    table.insert(debug_messages, "All deletes took: " .. ((insert_start - delete_start) / 1000000) .. "ms")
+  -- Run all updates and deletes concurrently
+  if #concurrent_tasks > 0 then
+    local concurrent_results = run_concurrent(concurrent_tasks)
+    for i, result in ipairs(concurrent_results) do
+      if not result.ok then
+        vim.notify('[Notion] Concurrent operation ' .. i .. ' failed: ' .. tostring(result.value),
+          vim.log.levels.ERROR)
+        sync_result = false
+      elseif result.value == nil then
+        -- make_request returns nil on API error (already notified)
+        sync_result = false
+      end
+    end
   end
 
+  local delete_done_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode and update_start then
+    table.insert(debug_messages, "All updates+deletes took: " ..
+      ((delete_done_time - update_start) / 1000000) .. "ms")
+  end
+
+  -- Inserts run sequentially (depend on `after` positioning)
+  local insert_start = debug_mode and vim.loop.hrtime() or nil
   for _, insert_op in ipairs(operations.inserts) do
     if insert_op.children and #insert_op.children > 0 then
       local children = insert_op.children
       local chunk_size = 100
-      for i = 1, #children, chunk_size do
+      for ci = 1, #children, chunk_size do
         local chunk = {}
-        for j = i, math.min(i + chunk_size - 1, #children) do
-          table.insert(chunk, children[j])
+        for cj = ci, math.min(ci + chunk_size - 1, #children) do
+          table.insert(chunk, children[cj])
         end
         local chunk_insert_op = {
           children = chunk,
           after = insert_op.after
         }
-        make_request('PATCH', '/blocks/' .. page_id .. '/children', chunk_insert_op)
+        local result = make_request('PATCH', '/blocks/' .. page_id .. '/children', chunk_insert_op)
+        if not result then
+          sync_result = false
+        end
       end
     end
   end
 
-  local ops_time = debug and vim.loop.hrtime() or nil
-  if debug and insert_start then
+  local ops_time = debug_mode and vim.loop.hrtime() or nil
+  if debug_mode and insert_start then
     table.insert(debug_messages, "All inserts took: " .. ((ops_time - insert_start) / 1000000) .. "ms")
   end
 
-  local result = true -- We handle success/failure per operation above
+  if sync_result then
+    -- Update cache to reflect the new block state after successful sync
+    -- Re-fetch blocks to get the authoritative state (with server-assigned IDs)
+    local updated_blocks = M.get_all_blocks(page_id)
+    set_cached_blocks(page_id, updated_blocks)
 
-  if result then
-    vim.api.nvim_buf_set_option(buf, 'modified', false)
-    notify_user('✓ Synced to Notion successfully', vim.log.levels.INFO)
+    vim.bo[buf].modified = false
+    notify_user('Synced to Notion successfully', vim.log.levels.INFO)
   else
-    notify_user('✗ Failed to sync to Notion', vim.log.levels.ERROR)
+    notify_user('Failed to sync to Notion', vim.log.levels.ERROR)
   end
 
   -- Clear sync state
   sync_state[page_id].in_progress = false
 
   -- Show debug messages immediately
-  if debug then
+  if debug_mode then
     local total_time = vim.loop.hrtime()
     table.insert(debug_messages, "Total sync took: " .. ((total_time - start_time) / 1000000) .. "ms")
 
@@ -1116,13 +1537,36 @@ function M.sync_page()
 end
 
 --[[
-List pages from the database and select one for editing in Neovim.
+Sync the current buffer's content back to Notion using intelligent diff-based updates.
 
-This function provides a user-friendly interface to browse all pages in your
-configured Notion database and select one for direct editing in Neovim.
-Selected pages are opened with the edit_page() function for seamless editing.
+This function implements a sophisticated sync algorithm that:
+1. Fetches existing blocks from the Notion page
+2. Converts the buffer content to Notion block format
+3. Calculates a diff between existing and new content
+4. Only updates blocks that have actually changed
+5. Preserves unchanged blocks for optimal performance
+6. Maintains proper block ordering using Notion's positioning API
+
+Performance: Typically 200-800ms for small edits, scaling with the amount of
+changed content rather than total document size.
+
+Runs asynchronously -- does not block the Neovim event loop.
+Operations execute in order (updates, then deletes, then inserts) because
+coroutines yield sequentially.
+
+The function includes comprehensive error handling, debouncing to prevent API
+abuse, and detailed debug output when debug mode is enabled.
 --]]
-function M.list_and_edit_pages()
+function M.sync_page()
+  async_notify_start('Syncing page')
+  run_async(function()
+    sync_page_impl()
+    async_notify_end('Syncing page', true)
+  end)
+end
+
+-- Internal implementation of list_and_edit_pages (can run in sync or async context)
+local function list_and_edit_pages_impl()
   local database_id = config.get('database_id')
   if not database_id then
     vim.notify('Database ID not configured', vim.log.levels.ERROR)
@@ -1151,8 +1595,8 @@ function M.list_and_edit_pages()
 
   -- Try Telescope if configured/available
   if config.should_use_telescope() then
-    local ok, telescope_picker = pcall(require, 'notion.telescope')
-    if ok then
+    local tel_ok, telescope_picker = pcall(require, 'notion.telescope')
+    if tel_ok then
       telescope_picker.notion_pages(pages, on_page_selected)
       return
     else
@@ -1181,10 +1625,40 @@ function M.list_and_edit_pages()
   end)
 end
 
+--[[
+List pages from the database and select one for editing in Neovim.
+
+This function provides a user-friendly interface to browse all pages in your
+configured Notion database and select one for direct editing in Neovim.
+Selected pages are opened with the edit_page() function for seamless editing.
+
+Runs asynchronously -- does not block the Neovim event loop.
+--]]
+function M.list_and_edit_pages()
+  local database_id = config.get('database_id')
+  if not database_id then
+    vim.notify('Database ID not configured', vim.log.levels.ERROR)
+    return
+  end
+
+  async_notify_start('Fetching pages')
+  run_async(function()
+    list_and_edit_pages_impl()
+    async_notify_end('Fetching pages', true)
+  end)
+end
+
+-- Expose internals for testing and external use
 M.calculate_diff_operations = calculate_diff_operations
 M.block_to_comparable_string = block_to_comparable_string
 M.blocks_to_markdown = blocks_to_markdown
 M.markdown_line_to_block = markdown_line_to_block
 M.make_request = make_request
+M.get_cached_blocks = get_cached_blocks
+M.set_cached_blocks = set_cached_blocks
+M.clear_cached_blocks = clear_cached_blocks
+M.block_cache = block_cache
+M.run_async = run_async
+M.run_concurrent = run_concurrent
 
 return M

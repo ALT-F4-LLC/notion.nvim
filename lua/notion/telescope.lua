@@ -1,7 +1,82 @@
 local M = {}
 
--- Cache for article content: { [page_id] = markdown_string }
+local config = require('notion.config')
+
+-- Maximum number of entries in the preview cache before LRU eviction kicks in
+local PREVIEW_CACHE_MAX_SIZE = 100
+
+-- LRU preview cache: { [page_id] = { content = markdown_string, timestamp = os.time(), last_access = os.time() } }
 local preview_cache = {}
+-- Track access order for LRU eviction (most recently accessed page_ids at end)
+local preview_cache_order = {}
+
+-- Get the TTL for preview cache entries (reuses the cache_ttl config option)
+local function get_cache_ttl()
+  local ttl = config.get('cache_ttl')
+  return ttl and ttl > 0 and ttl or 300 -- default 300 seconds
+end
+
+-- Remove the oldest (least recently used) entry from the preview cache
+local function evict_oldest_entry()
+  if #preview_cache_order == 0 then return end
+  local oldest_id = table.remove(preview_cache_order, 1)
+  preview_cache[oldest_id] = nil
+end
+
+-- Record an access for a page_id (move it to the end of the order list)
+local function touch_cache_entry(page_id)
+  -- Remove existing entry from order list
+  for i, id in ipairs(preview_cache_order) do
+    if id == page_id then
+      table.remove(preview_cache_order, i)
+      break
+    end
+  end
+  -- Add to end (most recently used)
+  table.insert(preview_cache_order, page_id)
+end
+
+-- Get a cached preview entry, returning nil if expired or missing
+local function get_preview_cache(page_id)
+  local entry = preview_cache[page_id]
+  if not entry then return nil end
+
+  -- Check TTL
+  local ttl = get_cache_ttl()
+  if os.time() - entry.timestamp >= ttl then
+    -- Expired: remove from cache
+    preview_cache[page_id] = nil
+    for i, id in ipairs(preview_cache_order) do
+      if id == page_id then
+        table.remove(preview_cache_order, i)
+        break
+      end
+    end
+    return nil
+  end
+
+  -- Mark as recently accessed
+  touch_cache_entry(page_id)
+  return entry.content
+end
+
+-- Store a preview entry in the cache with LRU eviction
+local function set_preview_cache(page_id, content)
+  -- If already cached, update in place
+  if preview_cache[page_id] then
+    preview_cache[page_id] = { content = content, timestamp = os.time() }
+    touch_cache_entry(page_id)
+    return
+  end
+
+  -- Evict oldest entries if at capacity
+  while #preview_cache_order >= PREVIEW_CACHE_MAX_SIZE do
+    evict_oldest_entry()
+  end
+
+  preview_cache[page_id] = { content = content, timestamp = os.time() }
+  table.insert(preview_cache_order, page_id)
+end
 
 -- Debounce timer for preview loading
 local preview_timer = nil
@@ -64,10 +139,11 @@ local function make_previewer()
       end
 
       -- Check cache first (instant display, bypass debounce)
-      if preview_cache[page_id] then
-        local cached_lines = vim.split(preview_cache[page_id], '\n')
+      local cached_content = get_preview_cache(page_id)
+      if cached_content then
+        local cached_lines = vim.split(cached_content, '\n')
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, cached_lines)
-        vim.api.nvim_buf_set_option(bufnr, 'filetype', 'markdown')
+        vim.bo[bufnr].filetype = 'markdown'
         return
       end
 
@@ -77,7 +153,7 @@ local function make_previewer()
         "",
         "Loading article content..."
       })
-      vim.api.nvim_buf_set_option(bufnr, 'filetype', 'markdown')
+      vim.bo[bufnr].filetype = 'markdown'
 
       -- Debounce: only load after user stops moving for 300ms
       preview_timer = vim.fn.timer_start(300, function()
@@ -100,15 +176,13 @@ local function make_previewer()
         -- Mark this page as loading
         loading_page_id = page_id
 
-        -- Fetch article content asynchronously
-        vim.schedule(function()
-          -- Require api module to access get_all_blocks and blocks_to_markdown
-          local api = require('notion.api')
-
-          -- Fetch blocks (this will block, but at least we're debounced)
+        -- Fetch article content asynchronously using coroutine-based async.
+        -- This no longer blocks the Neovim event loop.
+        local api = require('notion.api')
+        api.run_async(function()
           local blocks = api.get_all_blocks(page_id)
 
-          -- Clear loading state
+          -- Clear loading state (we're back on the main loop via vim.schedule)
           loading_page_id = nil
 
           if not blocks or #blocks == 0 then
@@ -122,7 +196,7 @@ local function make_previewer()
               "Last Edited: " .. format_time(page.last_edited_time),
             }
             local no_content_str = table.concat(no_content, '\n')
-            preview_cache[page_id] = no_content_str
+            set_preview_cache(page_id, no_content_str)
             if vim.api.nvim_buf_is_valid(bufnr) then
               vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, no_content)
             end
@@ -137,8 +211,8 @@ local function make_previewer()
           table.insert(markdown_lines, 1, "# " .. page.title)
 
           -- Cache the content
-          local content = table.concat(markdown_lines, '\n')
-          preview_cache[page_id] = content
+          local content_str = table.concat(markdown_lines, '\n')
+          set_preview_cache(page_id, content_str)
 
           -- Update buffer (check if still valid)
           if vim.api.nvim_buf_is_valid(bufnr) then
@@ -188,7 +262,13 @@ end
 
 -- Clear preview cache (useful for forcing refresh)
 function M.clear_preview_cache()
-  preview_cache = {}
+  -- Clear tables in place so exposed test references stay valid
+  for k in pairs(preview_cache) do
+    preview_cache[k] = nil
+  end
+  for i = #preview_cache_order, 1, -1 do
+    preview_cache_order[i] = nil
+  end
 
   -- Cancel any pending timer
   if preview_timer then
@@ -198,5 +278,12 @@ function M.clear_preview_cache()
 
   loading_page_id = nil
 end
+
+-- Expose internals for testing
+M._preview_cache = preview_cache
+M._preview_cache_order = preview_cache_order
+M._get_preview_cache = get_preview_cache
+M._set_preview_cache = set_preview_cache
+M.PREVIEW_CACHE_MAX_SIZE = PREVIEW_CACHE_MAX_SIZE
 
 return M

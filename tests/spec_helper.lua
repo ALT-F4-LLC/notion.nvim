@@ -285,8 +285,24 @@ _G.vim = {
   loop = {
     hrtime = function()
       return os.clock() * 1000000000 -- nanoseconds
-    end
+    end,
+    sleep = function() end,
   },
+
+  -- Mock vim.defer_fn: in tests, execute the callback immediately (synchronous)
+  defer_fn = function(fn, timeout)
+    fn()
+  end,
+
+  -- Mock vim.schedule: in tests, execute the callback immediately (synchronous)
+  schedule = function(fn)
+    fn()
+  end,
+
+  -- Mock vim.schedule_wrap: returns a wrapper that calls the function immediately
+  schedule_wrap = function(fn)
+    return fn
+  end,
 
   inspect = function(obj)
     -- Simple inspector for testing
@@ -295,7 +311,40 @@ _G.vim = {
     else
       return tostring(obj)
     end
-  end
+  end,
+
+  -- Mock vim.bo[buf].option = value (buffer-local options)
+  -- Uses a metatable so vim.bo[buf] returns a table that captures assignments
+  bo = setmetatable({}, {
+    __index = function(_, buf)
+      return setmetatable({}, {
+        __newindex = function(_, option, value)
+          -- Store in a per-buffer options table for test assertions if needed
+          if not _G._vim_bo_options then
+            _G._vim_bo_options = {}
+          end
+          if not _G._vim_bo_options[buf] then
+            _G._vim_bo_options[buf] = {}
+          end
+          _G._vim_bo_options[buf][option] = value
+        end,
+        __index = function(_, option)
+          if _G._vim_bo_options and _G._vim_bo_options[buf] then
+            return _G._vim_bo_options[buf][option]
+          end
+          return nil
+        end,
+      })
+    end,
+  }),
+
+  split = function(s, sep)
+    local parts = {}
+    for part in s:gmatch("([^" .. sep .. "]+)") do
+      table.insert(parts, part)
+    end
+    return parts
+  end,
 }
 
 -- Helper function to reset mocks between tests
@@ -303,6 +352,7 @@ local function reset_vim_mocks()
   vim.g = {}
   vim.env = {}
   vim.v.shell_error = 0
+  _G._vim_bo_options = {}
 end
 
 -- Export the helper function to the global scope

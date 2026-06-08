@@ -3,10 +3,11 @@ local M = {}
 M.defaults = {
   notion_token_cmd = nil, -- Command to retrieve token, e.g. {"doppler", "secrets", "get", "--plain", "NOTION_TOKEN"}
   database_id = nil,
-  page_size = 10,
+  page_size = 100,
   cache_ttl = 300,
   debug = false, -- Set to true to show timing information
   sync_debounce_ms = 1000, -- Minimum time between syncs (ms)
+  max_concurrent_requests = 5, -- Max parallel API requests during sync (updates/deletes)
   use_telescope = nil, -- nil = auto-detect, true = force telescope, false = force vim.ui.select
 }
 
@@ -38,7 +39,14 @@ local function sanitize_command_for_display(cmd)
   return "[REDACTED]"
 end
 
--- Helper function to execute a command and get the output
+-- Helper function to execute a command and get the output.
+-- NOTE: This runs synchronously via vim.fn.system(). For tools like Doppler or
+-- 1Password CLI, this can add 500ms-3s to Neovim startup. This is intentionally
+-- kept synchronous for simplicity and correctness: the token must be available
+-- before any API call, and deferring retrieval would add complexity to every
+-- call site. Most users mitigate the startup cost by lazy-loading the plugin
+-- (e.g., loading on command via lazy.nvim), which avoids running this at startup
+-- entirely.
 local function execute_command(cmd)
   if type(cmd) == "table" then
     -- Handle array of command parts
